@@ -2,6 +2,7 @@ package openconnect
 
 import (
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -142,7 +143,7 @@ func (b *CSTPConfigBuilder) AddRouteHeaders(splitIncludeRoutes, splitExcludeRout
 }
 
 // AddFixedHeaders 添加固定的响应头
-func (b *CSTPConfigBuilder) AddFixedHeaders() {
+func (b *CSTPConfigBuilder) AddFixedHeaders(tunnelAllDNS bool) {
 	b.responseBuilder.WriteString("X-CSTP-Lease-Duration: 1209600\r\n")
 	b.responseBuilder.WriteString("X-CSTP-Session-Timeout: none\r\n")
 	b.responseBuilder.WriteString("X-CSTP-Session-Timeout-Alert-Interval: 60\r\n")
@@ -150,7 +151,7 @@ func (b *CSTPConfigBuilder) AddFixedHeaders() {
 	b.responseBuilder.WriteString("X-CSTP-Idle-Timeout: 18000\r\n")
 	b.responseBuilder.WriteString("X-CSTP-Disconnected-Timeout: 18000\r\n")
 	b.responseBuilder.WriteString("X-CSTP-Keep: true\r\n")
-	b.responseBuilder.WriteString("X-CSTP-Tunnel-All-DNS: false\r\n")
+	b.responseBuilder.WriteString("X-CSTP-Tunnel-All-DNS: " + strconv.FormatBool(tunnelAllDNS) + "\r\n")
 	b.responseBuilder.WriteString("X-CSTP-Rekey-Time: 86400\r\n")
 	b.responseBuilder.WriteString("X-CSTP-Rekey-Method: new-tunnel\r\n")
 	b.responseBuilder.WriteString("X-CSTP-MSIE-Proxy-Lockdown: true\r\n")
@@ -171,10 +172,7 @@ func (b *CSTPConfigBuilder) String() string {
 
 // intToStr 将 int 转换为 string
 func intToStr(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	return string(rune('0'+i%10)) + intToStr(i/10)
+	return strconv.Itoa(i)
 }
 
 // DTLSSessionConfig DTLS 会话配置
@@ -230,3 +228,4 @@ type LogEntry struct {
 	Level     string
 	Message   string
 }
+

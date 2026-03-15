@@ -81,12 +81,13 @@ func (rc *RouteCalculator) calculateDNSRoutes(routeMap map[string]bool) []string
 
 // calculatePolicyRoutes 从用户策略计算路由
 func (rc *RouteCalculator) calculatePolicyRoutes(routeMap map[string]bool, existingRoutes []string) []string {
-	if rc.user.PolicyID == 0 || len(rc.user.Policy.Routes) == 0 {
+	userPolicy := rc.user.GetPolicy()
+	if userPolicy == nil || len(userPolicy.Routes) == 0 {
 		return existingRoutes
 	}
 
 	routes := existingRoutes
-	for _, route := range rc.user.Policy.Routes {
+	for _, route := range userPolicy.Routes {
 		if route.Network == "" {
 			continue
 		}
@@ -152,6 +153,10 @@ func (rc *RouteCalculator) calculateExcludeRoutes(excludeRouteMap map[string]boo
 
 // handleAllowLan 处理 AllowLan 配置
 func (rc *RouteCalculator) handleAllowLan(excludeRouteMap map[string]bool, existingRoutes []string) []string {
+	if rc.tunnelMode != "full" {
+		return existingRoutes
+	}
+
 	allowLan := false
 	for _, group := range rc.user.Groups {
 		if group.AllowLan {
@@ -183,3 +188,4 @@ func (rc *RouteCalculator) handleAllowLan(excludeRouteMap map[string]bool, exist
 	}
 	return routes
 }
+

@@ -686,7 +686,8 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 		return err
 	}
 	netmask := net.IP(ipNet.Mask).String()
-	tunnelMode := getUserTunnelMode(user)
+	requestedTunnelMode := getUserTunnelMode(user)
+	effectiveTunnelMode := requestedTunnelMode
 
 	// 获取主机名
 	hostname := configutil.GetVPNProfileName()
@@ -702,29 +703,48 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 	dtlsConfig := h.calculateDTLSConfig(clientCipherSuite, clientMasterSecret, mobileConfig)
 
 	// 计算路由配置
-	routeCalculator := NewRouteCalculator(h.config, user, tunnelMode, dnsServers)
+	routeCalculator := NewRouteCalculator(h.config, user, effectiveTunnelMode, dnsServers)
 	splitIncludeRoutes, splitExcludeRoutes := routeCalculator.CalculateRoutes()
 
 	// 计算 Split-DNS 配置
 	splitDNSDomains := h.calculateSplitDNS(user)
+
+	if effectiveTunnelMode != "full" && len(splitIncludeRoutes) == 0 {
+		log.Printf("OpenConnect: No split-include routes available for user %s in split mode, falling back to full tunnel for client compatibility", user.Username)
+		effectiveTunnelMode = "full"
+		routeCalculator = NewRouteCalculator(h.config, user, effectiveTunnelMode, dnsServers)
+		splitIncludeRoutes, splitExcludeRoutes = routeCalculator.CalculateRoutes()
+	}
+
+	if effectiveTunnelMode == "full" && len(splitDNSDomains) > 0 {
+		log.Printf("OpenConnect: Suppressing Split-DNS for user %s because effective tunnel mode is full", user.Username)
+		splitDNSDomains = nil
+	}
 
 	// 获取编码信息
 	cstpAcceptEncoding := getHeaderCaseInsensitive(c, "X-Cstp-Accept-Encoding", "X-CSTP-Accept-Encoding")
 	dtlsAcceptEncoding := getHeaderCaseInsensitive(c, "X-Dtls-Accept-Encoding", "X-DTLS-Accept-Encoding")
 
 	// 构建响应
-	builder := NewCSTPConfigBuilder(h.config, user, tunnelMode, netmask, isMobile)
+	builder := NewCSTPConfigBuilder(h.config, user, effectiveTunnelMode, netmask, isMobile)
 	builder.BuildBasicHeaders(hostname)
 	builder.AddCompressionHeaders(cstpAcceptEncoding, dtlsAcceptEncoding)
 	builder.AddMTUHeader(h.config.VPN.MTU)
 	builder.AddKeepaliveHeaders(mobileConfig.DPD, mobileConfig.Keepalive)
 	builder.AddDTLSHeaders(dtlsConfig.SessionID, dtlsConfig.Port, dtlsConfig.DPDStr, dtlsConfig.KeepaliveStr, dtlsConfig.CipherSuiteHeader)
-	builder.AddDNSHeaders(dnsServers)
-	builder.AddSplitDNSHeaders(splitDNSDomains)
+	hasVPNDNS := builder.AddDNSHeaders(dnsServers)
+	if effectiveTunnelMode != "full" && hasVPNDNS {
+		builder.AddSplitDNSHeaders(splitDNSDomains)
+	} else if len(splitDNSDomains) > 0 && !hasVPNDNS {
+		log.Printf("OpenConnect: Suppressing Split-DNS for user %s because no VPN DNS servers are configured", user.Username)
+	}
 	builder.AddRouteHeaders(splitIncludeRoutes, splitExcludeRoutes)
-	builder.AddFixedHeaders()
+	builder.AddFixedHeaders(hasVPNDNS && effectiveTunnelMode == "full")
 
 	response := builder.String()
+
+	log.Printf("OpenConnect: CSTP effective mode for user %s: requested=%s effective=%s include_routes=%d exclude_routes=%d split_dns=%d has_vpn_dns=%t",
+		user.Username, requestedTunnelMode, effectiveTunnelMode, len(splitIncludeRoutes), len(splitExcludeRoutes), len(splitDNSDomains), hasVPNDNS)
 
 	// 日志输出
 	log.Printf("OpenConnect: ========== CSTP Config XML for user %s (VPN IP: %s) ==========", user.Username, user.VPNIP)
@@ -792,7 +812,6 @@ func (h *Handler) calculateDTLSConfig(clientCipherSuite, clientMasterSecret stri
 
 // calculateSplitDNS 计算 Split-DNS 配置
 func (h *Handler) calculateSplitDNS(user *models.User) []string {
-	defaultSplitDNS := "ZVPN.local"
 	splitDNSDomains := []string{}
 
 	userPolicy := user.GetPolicy()
@@ -801,12 +820,11 @@ func (h *Handler) calculateSplitDNS(user *models.User) []string {
 		splitDNSDomains = getSplitDNSDomains(userPolicy)
 		log.Printf("OpenConnect: Parsed %d Split-DNS domains for user %s: %v", len(splitDNSDomains), user.Username, splitDNSDomains)
 	} else {
-		log.Printf("OpenConnect: No policy found for user %s, will use default Split-DNS", user.Username)
+		log.Printf("OpenConnect: No policy found for user %s, will not send Split-DNS", user.Username)
 	}
 
 	if len(splitDNSDomains) == 0 {
-		splitDNSDomains = []string{defaultSplitDNS}
-		log.Printf("OpenConnect: Using default Split-DNS domain '%s' for user %s", defaultSplitDNS, user.Username)
+		log.Printf("OpenConnect: No Split-DNS domains configured for user %s", user.Username)
 	}
 
 	return splitDNSDomains
@@ -1094,3 +1112,4 @@ func closeConnectionGracefully(conn net.Conn) {
 		}
 	}
 }
+

@@ -180,8 +180,11 @@ func (u *User) GetPolicy() *Policy {
 
 	log.Printf("User.GetPolicy: 合并后策略路由数量: %d，排除路由数量: %d", len(mergedPolicy.Routes), len(mergedPolicy.ExcludeRoutes))
 
-	if len(mergedPolicy.Routes) == 0 {
-		log.Printf("User.GetPolicy: 合并后没有路由，返回nil")
+	if len(mergedPolicy.Routes) == 0 &&
+		len(mergedPolicy.ExcludeRoutes) == 0 &&
+		mergedPolicy.DNSServers == "" &&
+		mergedPolicy.SplitDNS == "" {
+		log.Printf("User.GetPolicy: 合并后没有任何可下发策略内容，返回nil")
 		return nil
 	}
 
@@ -302,4 +305,5 @@ func (u *User) CheckOTPOnly(password string) bool {
 	otpAuth := auth.NewOTPAuthenticator("ZVPN")
 	return otpAuth.ValidateOTP(u.OTPSecret, otpCode)
 }
+
 
