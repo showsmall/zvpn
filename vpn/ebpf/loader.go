@@ -1,10 +1,9 @@
-//go:build !ebpf
-// +build !ebpf
+//go:build !linux || !ebpf
+// +build !linux !ebpf
 
 package ebpf
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 )
@@ -119,6 +118,9 @@ func (x *XDPProgram) GetPolicyStats(policyID uint32) (uint64, error) {
 
 // Close detaches and closes the XDP program
 func (x *XDPProgram) Close() error {
+	if x == nil {
+		return nil
+	}
 	if x.objs != nil {
 		return x.objs.Close()
 	}
@@ -133,8 +135,16 @@ func (x *XDPProgram) SetPublicIP(publicIP net.IP) error {
 	return fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
 }
 
-// SetVPNGateway sets the VPN gateway IP for the XDP program
-func (x *XDPProgram) SetVPNGateway(gatewayIP net.IP) error {
+// GetPublicIP retrieves the configured public IP
+func (x *XDPProgram) GetPublicIP() (net.IP, error) {
+	if x == nil {
+		return nil, fmt.Errorf("eBPF program not loaded")
+	}
+	return nil, fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
+}
+
+// SetVPNNetwork sets the VPN network configuration
+func (x *XDPProgram) SetVPNNetwork(vpnNetwork string) error {
 	if x == nil {
 		return fmt.Errorf("eBPF program not loaded")
 	}
@@ -165,16 +175,7 @@ func (x *XDPProgram) IsIPBlocked(ip net.IP) (bool, uint64, error) {
 	return false, 0, fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
 }
 
-// RateLimitConfig represents the rate limit and DDoS protection configuration
-type RateLimitConfig struct {
-	EnableRateLimit      uint8  // 0 = disabled, 1 = enabled
-	_                    [7]byte
-	RateLimitPerIP       uint64 // Packets per second per IP
-	EnableDDoSProtection uint8  // 0 = disabled, 1 = enabled
-	_                    [7]byte
-	DDoSThreshold        uint64 // Packets per second threshold
-	DDoSBlockDuration    uint64 // Block duration in nanoseconds
-}
+// RateLimitConfig is in bpf_types.go (mirrors C struct)
 
 // UpdateRateLimitConfig updates the rate limit and DDoS protection configuration in eBPF
 func (x *XDPProgram) UpdateRateLimitConfig(config RateLimitConfig) error {
@@ -193,15 +194,7 @@ func (x *XDPProgram) GetRateLimitConfig() (RateLimitConfig, error) {
 	return config, fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
 }
 
-func ipToUint32(ip net.IP) uint32 {
-	ip = ip.To4()
-	if ip == nil {
-		return 0
-	}
-	return binary.BigEndian.Uint32(ip)
-}
-
-// XDPProgram stub when eBPF is not compiled
+// xdpObjects stub when eBPF is not compiled
 type xdpObjects struct{}
 
 func (x *xdpObjects) Close() error {

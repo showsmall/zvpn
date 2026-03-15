@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/fisker/zvpn/config"
-	"github.com/fisker/zvpn/database"
+	"github.com/fisker/zvpn/internal/database"
 	"github.com/fisker/zvpn/models"
-	"github.com/fisker/zvpn/vpn"
+	vpnserver "github.com/fisker/zvpn/vpn/server"
 	"github.com/fisker/zvpn/vpn/policy"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -18,14 +18,14 @@ import (
 
 type HookHandler struct {
 	config    *config.Config
-	vpnServer *vpn.VPNServer
+	vpnServer *vpnserver.VPNServer
 }
 
 func NewHookHandler(cfg *config.Config) *HookHandler {
 	return &HookHandler{config: cfg}
 }
 
-func (h *HookHandler) SetVPNServer(vpnServer *vpn.VPNServer) {
+func (h *HookHandler) SetVPNServer(vpnServer *vpnserver.VPNServer) {
 	h.vpnServer = vpnServer
 }
 

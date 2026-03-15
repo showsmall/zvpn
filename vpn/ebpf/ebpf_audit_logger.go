@@ -1,5 +1,5 @@
-//go:build ebpf
-// +build ebpf
+//go:build linux && ebpf
+// +build linux,ebpf
 
 package ebpf
 
@@ -10,11 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fisker/zvpn/database"
+	"github.com/fisker/zvpn/internal/database"
 	"github.com/fisker/zvpn/models"
 	"gorm.io/gorm"
 )
-
 
 // PolicyEvent represents a policy match event from eBPF (both ALLOW and DENY)
 type PolicyEvent struct {
@@ -84,6 +83,13 @@ func (b *auditLogBuffer) addLog(log models.AuditLog) {
 	}
 }
 
+// StartAuditLoggerIfEnabled starts eBPF audit logger if eBPF program is available
+func StartAuditLoggerIfEnabled(xdpProgram *XDPProgram) {
+	if xdpProgram != nil {
+		StartAuditLogger(xdpProgram)
+	}
+}
+
 // StartAuditLogger starts a goroutine to monitor eBPF policy events and log them
 func StartAuditLogger(xdpProgram *XDPProgram) {
 	if xdpProgram == nil || xdpProgram.policyEvents == nil {
@@ -127,9 +133,9 @@ func StartAuditLogger(xdpProgram *XDPProgram) {
 
 // logPolicyEvent logs a policy event from eBPF as an audit log (both ALLOW and DENY)
 func logPolicyEvent(event *PolicyEvent) error {
-	// Convert IPs (using uint32ToIP from loader_ebpf.go)
-	srcIP := uint32ToIP(event.SrcIP)
-	dstIP := uint32ToIP(event.DstIP)
+	// Convert IPs (mirrors C struct layout)
+	srcIP := Uint32ToIP(event.SrcIP)
+	dstIP := Uint32ToIP(event.DstIP)
 
 	// Determine network layer protocol string
 	netProtocolStr := "unknown"

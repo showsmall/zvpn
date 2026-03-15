@@ -360,13 +360,13 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 		return
 	}
 
-	h.dtlsLock.Lock()
+	// DTLS locking handled by manager
 	var matchedClient *TunnelClient
 	var matchedClientKey string
 	var matchedVPNIP string
 
 	if sessionID != "" {
-		for vpnIP, clientInfo := range h.dtlsClients {
+		for vpnIP, clientInfo := range h.dtlsManager.GetAllClients() {
 			if clientInfo != nil && clientInfo.DTLSSessionID == sessionID {
 				matchedClient = clientInfo.Client
 				matchedClientKey = vpnIP
@@ -383,7 +383,7 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 	}
 
 	if matchedClient == nil {
-		for vpnIP, clientInfo := range h.dtlsClients {
+		for vpnIP, clientInfo := range h.dtlsManager.GetAllClients() {
 			if clientInfo != nil && clientInfo.UDPAddr != nil &&
 				clientInfo.UDPAddr.IP.Equal(udpAddr.IP) && clientInfo.UDPAddr.Port == udpAddr.Port {
 				matchedClient = clientInfo.Client
@@ -405,7 +405,7 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 	}
 
 	if matchedClient == nil {
-		for vpnIP, clientInfo := range h.dtlsClients {
+		for vpnIP, clientInfo := range h.dtlsManager.GetAllClients() {
 			if clientInfo != nil && clientInfo.Client != nil && clientInfo.DTLSConn == nil {
 				matchedClient = clientInfo.Client
 				matchedClientKey = vpnIP
@@ -454,11 +454,11 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 			}
 		}
 	}
-	h.dtlsLock.Unlock()
+	// DTLS unlocking handled by manager
 
 	if matchedClient == nil {
 		log.Printf("DTLS: 所有匹配方法都失败 - 会话ID: %s, 远程地址: %s, 当前客户端数量: %d",
-			sessionID[:16]+"...", udpAddr, len(h.dtlsClients))
+			sessionID[:16]+"...", udpAddr, h.dtlsManager.GetClientCount())
 		return
 	}
 
@@ -467,13 +467,13 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 
 	// 获取客户端信息以判断是否为移动端
 	var isMobile bool
-	h.dtlsLock.RLock()
+	// DTLS RLock handled by manager
 	if matchedVPNIP != "" {
-		if clientInfo, exists := h.dtlsClients[matchedVPNIP]; exists && clientInfo != nil {
+		if clientInfo, exists := h.dtlsManager.GetByVPNIP(matchedVPNIP); exists && clientInfo != nil {
 			isMobile = clientInfo.IsMobile
 		}
 	}
-	h.dtlsLock.RUnlock()
+	// DTLS RUnlock handled by manager
 
 	readTimeout := 30 * time.Second
 	if matchedClient.VPNServer != nil {
@@ -510,9 +510,9 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 
 				if matchedVPNIP != "" {
 
-					h.dtlsLock.RLock()
-					clientInfo, stillExists := h.dtlsClients[matchedVPNIP]
-					h.dtlsLock.RUnlock()
+					// DTLS RLock handled by manager
+					clientInfo, stillExists := h.dtlsManager.GetByVPNIP(matchedVPNIP)
+					// DTLS RUnlock handled by manager
 
 					if stillExists && clientInfo != nil {
 						dtlsKeepalive := []byte{PacketTypeKeepalive}

@@ -1,34 +1,41 @@
 package main
 
 import (
-	"log"
+	"fmt"
 
 	"github.com/fisker/zvpn/config"
-	"github.com/fisker/zvpn/database"
+	"github.com/fisker/zvpn/internal/database"
 	"github.com/fisker/zvpn/server"
-	"github.com/fisker/zvpn/vpn"
+	vpnserver "github.com/fisker/zvpn/vpn/server"
 )
 
 var (
-	Version   = "dev"
-	BuildTime = "unknown"
-	GitCommit = "unknown"
+	Version   = "-"
+	BuildTime = "-"
+	GitCommit = "-"
 )
 
 func main() {
+	if err := run(); err != nil {
+		panic(err)
+	}
+}
+
+func run() error {
 	cfg := config.Load()
 
 	if err := database.Init(cfg); err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
+		return fmt.Errorf("failed to initialize database: %w", err)
 	}
 
-	vpnServer, err := vpn.NewVPNServer(cfg)
+	vpnServer, err := vpnserver.NewVPNServer(cfg)
 	if err != nil {
-		log.Fatalf("Failed to initialize VPN server: %v", err)
+		return fmt.Errorf("failed to initialize VPN server: %w", err)
 	}
 
-	srv := server.New(cfg, vpnServer)
-	if err := srv.Start(); err != nil {
-		log.Fatalf("Server error: %v", err)
+	if err := server.New(cfg, vpnServer).Start(); err != nil {
+		return fmt.Errorf("server error: %w", err)
 	}
+
+	return nil
 }

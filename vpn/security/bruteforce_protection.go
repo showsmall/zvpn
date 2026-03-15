@@ -72,9 +72,6 @@ func (bp *BruteforceProtection) UpdateConfig(maxAttempts int, lockoutDuration, w
 	bp.lockoutDuration = lockoutDuration
 	bp.windowDuration = windowDuration
 	bp.enabled = enabled
-	
-	log.Printf("Bruteforce Protection: Config updated - maxAttempts=%d, lockout=%v, window=%v, enabled=%v",
-		maxAttempts, lockoutDuration, windowDuration, enabled)
 }
 
 // AddWhitelistIP 添加白名单IP
@@ -85,7 +82,6 @@ func (bp *BruteforceProtection) AddWhitelistIP(ip string) error {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 	bp.whitelistIPs[ip] = true
-	log.Printf("Bruteforce Protection: IP %s added to whitelist", ip)
 	return nil
 }
 
@@ -94,7 +90,6 @@ func (bp *BruteforceProtection) RemoveWhitelistIP(ip string) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 	delete(bp.whitelistIPs, ip)
-	log.Printf("Bruteforce Protection: IP %s removed from whitelist", ip)
 }
 
 // GetWhitelistIPs 获取所有白名单IP
@@ -131,8 +126,6 @@ func (bp *BruteforceProtection) BlockIP(ip string, duration time.Duration) error
 	if bp.ebpfProgram != nil {
 		bp.blockIPInEBPF(ip)
 	}
-	
-	log.Printf("Bruteforce Protection: IP %s manually blocked for %v", ip, duration)
 	return nil
 }
 
@@ -154,8 +147,6 @@ func (bp *BruteforceProtection) UnblockIP(ip string) {
 	if bp.ebpfProgram != nil {
 		bp.unblockIPInEBPF(ip)
 	}
-	
-	log.Printf("Bruteforce Protection: IP %s manually unblocked", ip)
 }
 
 // GetBlockedIPs 获取所有被封禁的IP及其解封时间

@@ -11,7 +11,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/fisker/zvpn/database"
+	"github.com/fisker/zvpn/internal/database"
 	"github.com/fisker/zvpn/models"
 )
 

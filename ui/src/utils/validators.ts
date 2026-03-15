@@ -20,12 +20,6 @@ export function validateCIDR(cidr: string): boolean {
   return re.test(cidr)
 }
 
-// 验证域名
-export function validateDomain(domain: string): boolean {
-  const re = /^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/
-  return re.test(domain)
-}
-
 // 验证端口
 export function validatePort(port: number): boolean {
   return port >= 1 && port <= 65535

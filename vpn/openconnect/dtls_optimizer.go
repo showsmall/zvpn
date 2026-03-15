@@ -2,7 +2,6 @@ package openconnect
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"time"
 )
@@ -84,7 +83,6 @@ func (o *DTLSOptimizer) PreloadRoutes(userID uint, vpnIP string, policyID uint, 
 	for _, routeStr := range routes {
 		_, _, err := net.ParseCIDR(routeStr)
 		if err != nil {
-			log.Printf("DTLS Optimizer: Failed to parse route %s: %v", routeStr, err)
 			continue
 		}
 
@@ -97,18 +95,13 @@ func (o *DTLSOptimizer) PreloadRoutes(userID uint, vpnIP string, policyID uint, 
 		}
 
 		o.preloadedRoutes[routeKey+"_"+routeStr] = preloadedRoute
-		log.Printf("DTLS Optimizer: ✓ Preloaded route %s for user %d", routeStr, userID)
 	}
-
-	// 缓存客户端匹配信息
 	o.clientMatchCache[vpnIP] = &ClientMatchInfo{
 		UserID:    userID,
 		VPNIP:     vpnIP,
 		PolicyID:  policyID,
 		MatchedAt: time.Now(),
 	}
-
-	log.Printf("DTLS Optimizer: ✓ Preloaded %d routes for user %d (VPN IP: %s)", len(routes), userID, vpnIP)
 }
 
 // ApplyPreloadedRoutes 应用预加载的路由
@@ -130,18 +123,13 @@ func (o *DTLSOptimizer) ApplyPreloadedRoutes(userID uint, policyID uint, routeMa
 			if len(key) > len(routeKey) && key[:len(routeKey)] == routeKey {
 				_, ipNet, err := net.ParseCIDR(preloadedRoute.Network)
 				if err != nil {
-					log.Printf("DTLS Optimizer: Failed to parse preloaded route %s: %v", preloadedRoute.Network, err)
 					continue
 				}
-
-				// 应用路由到内核路由表
 				if err := rm.AddRoute(ipNet, preloadedRoute.Gateway, preloadedRoute.Metric); err != nil {
-					log.Printf("DTLS Optimizer: Failed to apply preloaded route %s: %v", preloadedRoute.Network, err)
-				} else {
-					preloadedRoute.IsActive = true
-					appliedCount++
-					log.Printf("DTLS Optimizer: ✓ Applied preloaded route %s (total: %d)", preloadedRoute.Network, appliedCount)
+					continue
 				}
+				preloadedRoute.IsActive = true
+				appliedCount++
 			}
 		}
 
@@ -151,8 +139,6 @@ func (o *DTLSOptimizer) ApplyPreloadedRoutes(userID uint, policyID uint, routeMa
 				delete(o.preloadedRoutes, key)
 			}
 		}
-
-		log.Printf("DTLS Optimizer: ✓ Applied %d preloaded routes for user %d", appliedCount, userID)
 		return nil
 	}
 
@@ -215,16 +201,13 @@ func (o *DTLSOptimizer) Cleanup() {
 			delete(o.preloadedRoutes, key)
 		}
 	}
-
-	log.Printf("DTLS Optimizer: Cleanup completed")
 }
 
-// GetOptimizationStats 获取优化统计信息
+// GetOptimizationStats returns optimization statistics
 func (o *DTLSOptimizer) GetOptimizationStats() map[string]interface{} {
 	return map[string]interface{}{
 		"preloaded_routes_count": len(o.preloadedRoutes),
 		"cached_clients_count":   len(o.clientMatchCache),
 		"config":                 o.config,
-		"uptime":                 time.Since(time.Now()), // 实际应该是创建时间
 	}
 }

@@ -1,9 +1,7 @@
 package policy
 
 import (
-	"encoding/binary"
 	"fmt"
-	"log"
 	"net"
 
 	"github.com/fisker/zvpn/vpn/ebpf"
@@ -89,7 +87,7 @@ func (e *EBPFLoader) addACLPolicy(policyID uint32, hook *ACLHook, action Action)
 		for _, network := range hook.srcMatcher.Networks {
 			// Create policy for network with CIDR mask
 			srcIP := network.IP
-			srcMask := ipToUint32(net.IP(network.Mask))
+			srcMask := ebpf.IPToUint32(net.IP(network.Mask))
 			dstIP := net.IPv4(0, 0, 0, 0) // Any destination
 
 			currentID := policyID + uint32(len(policyIDs))
@@ -104,7 +102,7 @@ func (e *EBPFLoader) addACLPolicy(policyID uint32, hook *ACLHook, action Action)
 				0, 0, 0, 0, // Any ports
 				protocolMask,
 			); err != nil {
-				return fmt.Errorf("failed to add ACL source network policy: %w", err)
+				return fmt.Errorf("add ACL source network: %w", err)
 			}
 			policyIDs = append(policyIDs, currentID)
 		}
@@ -124,7 +122,7 @@ func (e *EBPFLoader) addACLPolicy(policyID uint32, hook *ACLHook, action Action)
 				0, 0, 0, 0, // Any ports
 				protocolMask,
 			); err != nil {
-				return fmt.Errorf("failed to add ACL source IP policy: %w", err)
+				return fmt.Errorf("add ACL source IP: %w", err)
 			}
 			policyIDs = append(policyIDs, currentID)
 		}
@@ -135,7 +133,7 @@ func (e *EBPFLoader) addACLPolicy(policyID uint32, hook *ACLHook, action Action)
 		for _, network := range hook.dstMatcher.Networks {
 			srcIP := net.IPv4(0, 0, 0, 0) // Any source
 			dstIP := network.IP
-			dstMask := ipToUint32(net.IP(network.Mask))
+			dstMask := ebpf.IPToUint32(net.IP(network.Mask))
 
 			currentID := policyID + uint32(len(policyIDs))
 			if err := e.xdpProgram.AddPolicyWithMask(
@@ -149,7 +147,7 @@ func (e *EBPFLoader) addACLPolicy(policyID uint32, hook *ACLHook, action Action)
 				0, 0, 0, 0, // Any ports
 				protocolMask,
 			); err != nil {
-				return fmt.Errorf("failed to add ACL destination network policy: %w", err)
+				return fmt.Errorf("add ACL destination network: %w", err)
 			}
 			policyIDs = append(policyIDs, currentID)
 		}
@@ -169,7 +167,7 @@ func (e *EBPFLoader) addACLPolicy(policyID uint32, hook *ACLHook, action Action)
 				0, 0, 0, 0, // Any ports
 				protocolMask,
 			); err != nil {
-				return fmt.Errorf("failed to add ACL destination IP policy: %w", err)
+				return fmt.Errorf("add ACL destination IP: %w", err)
 			}
 			policyIDs = append(policyIDs, currentID)
 		}
@@ -187,16 +185,13 @@ func (e *EBPFLoader) addACLPolicy(policyID uint32, hook *ACLHook, action Action)
 			0, 0, 0, 0, // Any ports
 			protocolMask,
 		); err != nil {
-			return fmt.Errorf("failed to add catch-all ACL policy: %w", err)
+			return fmt.Errorf("add catch-all ACL: %w", err)
 		}
 		policyIDs = append(policyIDs, policyID)
 	}
 
 	// Store policy IDs for this hook
 	e.hookPolicies[hook.Name()] = policyIDs
-
-	log.Printf("eBPF: Added ACL policy for hook %s: %d policy entries created (policy IDs: %v)",
-		hook.Name(), len(policyIDs), policyIDs)
 
 	return nil
 }
@@ -237,11 +232,10 @@ func (e *EBPFLoader) addPortFilterPolicy(policyID uint32, hook *PortFilterHook, 
 			port, 0, 0, 0, // Source port, no range, any dest port
 			protocolMask,
 		); err != nil {
-			return fmt.Errorf("failed to add port filter policy: %w", err)
+			return fmt.Errorf("add port filter: %w", err)
 		}
 		policyIDs = append(policyIDs, currentID)
 
-		// Destination port policy
 		currentID = policyID + uint32(len(policyIDs))
 		if err := e.xdpProgram.AddPolicyWithMask(
 			currentID,
@@ -249,11 +243,11 @@ func (e *EBPFLoader) addPortFilterPolicy(policyID uint32, hook *PortFilterHook, 
 			ebpfAction,
 			net.IPv4(0, 0, 0, 0),
 			net.IPv4(0, 0, 0, 0),
-			0, 0, // No IP masks
-			0, 0, port, 0, // Any source port, dest port, no range
+			0, 0,
+			0, 0, port, 0,
 			protocolMask,
 		); err != nil {
-			return fmt.Errorf("failed to add port filter policy: %w", err)
+			return fmt.Errorf("add port filter: %w", err)
 		}
 		policyIDs = append(policyIDs, currentID)
 	}
@@ -272,11 +266,10 @@ func (e *EBPFLoader) addPortFilterPolicy(policyID uint32, hook *PortFilterHook, 
 			portRange.Start, portRange.End, 0, 0, // Source port range
 			protocolMask,
 		); err != nil {
-			return fmt.Errorf("failed to add port range policy: %w", err)
+			return fmt.Errorf("add port range: %w", err)
 		}
 		policyIDs = append(policyIDs, currentID)
 
-		// Destination port range
 		currentID = policyID + uint32(len(policyIDs))
 		if err := e.xdpProgram.AddPolicyWithMask(
 			currentID,
@@ -284,20 +277,17 @@ func (e *EBPFLoader) addPortFilterPolicy(policyID uint32, hook *PortFilterHook, 
 			ebpfAction,
 			net.IPv4(0, 0, 0, 0),
 			net.IPv4(0, 0, 0, 0),
-			0, 0, // No IP masks
-			0, 0, portRange.Start, portRange.End, // Dest port range
+			0, 0,
+			0, 0, portRange.Start, portRange.End,
 			protocolMask,
 		); err != nil {
-			return fmt.Errorf("failed to add port range policy: %w", err)
+			return fmt.Errorf("add port range: %w", err)
 		}
 		policyIDs = append(policyIDs, currentID)
 	}
 
 	// Store policy IDs for this hook
 	e.hookPolicies[hook.Name()] = policyIDs
-
-	log.Printf("eBPF: Added PortFilter policy for hook %s: %d policy entries created (policy IDs: %v)",
-		hook.Name(), len(policyIDs), policyIDs)
 
 	return nil
 }
@@ -312,8 +302,6 @@ func (e *EBPFLoader) addUserPolicy(policyID uint32, hook *UserPolicyHook, action
 	ebpfAction := uint32(action)
 	ebpfHookPoint := uint32(hook.HookPoint())
 
-	// Create a catch-all policy for user-based rules
-	// In production, you would maintain a user->IP mapping in eBPF
 	if err := e.xdpProgram.AddPolicy(
 		policyID,
 		ebpfHookPoint,
@@ -322,9 +310,9 @@ func (e *EBPFLoader) addUserPolicy(policyID uint32, hook *UserPolicyHook, action
 		net.IPv4(0, 0, 0, 0),
 		0, 0, 0,
 	); err != nil {
-		return fmt.Errorf("failed to add user policy: %w", err)
+		return fmt.Errorf("add user policy: %w", err)
 	}
-
+	e.hookPolicies[hook.Name()] = []uint32{policyID}
 	return nil
 }
 
@@ -350,7 +338,7 @@ func (e *EBPFLoader) RemoveHookPolicies(hookName string) error {
 
 	for _, policyID := range policyIDs {
 		if err := e.xdpProgram.RemovePolicy(policyID); err != nil {
-			return fmt.Errorf("failed to remove policy %d: %w", policyID, err)
+			return fmt.Errorf("remove policy %d: %w", policyID, err)
 		}
 	}
 
@@ -370,24 +358,6 @@ func (e *EBPFLoader) GetOrAllocatePolicyID(hookName string) uint32 {
 	e.policyIDMap[hookName] = id
 	e.nextPolicyID++
 	return id
-}
-
-// Helper functions for IP conversion
-func ipToUint32(ip net.IP) uint32 {
-	ip = ip.To4()
-	if ip == nil {
-		return 0
-	}
-	return binary.BigEndian.Uint32(ip)
-}
-
-func uint32ToIP(ip uint32) net.IP {
-	return net.IP{
-		byte(ip >> 24),
-		byte(ip >> 16),
-		byte(ip >> 8),
-		byte(ip),
-	}
 }
 
 // AddRoute adds a routing rule to eBPF

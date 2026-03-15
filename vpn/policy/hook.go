@@ -5,8 +5,8 @@ package policy
 type HookPoint int
 
 // MaxHookChainEntries limits how many policies are chained per hook point in eBPF.
-// XDP 侧遍历 0..63，因此保持 64 的上限以避免链被截断。
-const MaxHookChainEntries = 64
+// Must match POLICY_CHAIN_DEPTH in xdp_program.c (32 to avoid ARM64 LLVM "Branch target out of insn range").
+const MaxHookChainEntries = 32
 
 const (
 	// HookPreRouting - Before routing decision

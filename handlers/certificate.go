@@ -19,7 +19,7 @@ type CertificateManager interface {
 	GetDefaultCert() *CertInfo
 	UpdateDefaultCert(certFile, keyFile string) error
 	UpdateDefaultCertFromBytes(certBytes, keyBytes []byte) error
-	UpdateDefaultCertFromBytesAndSave(certBytes, keyBytes []byte) error // 保存到配置文件路径（参考 anylink）
+	UpdateDefaultCertFromBytesAndSave(certBytes, keyBytes []byte) error 
 }
 
 type CertInfo struct {

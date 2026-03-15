@@ -9,9 +9,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fisker/zvpn/internal/compression"
 	"github.com/fisker/zvpn/models"
-	"github.com/fisker/zvpn/vpn"
+	vpnserver "github.com/fisker/zvpn/vpn/server"
 	"github.com/fisker/zvpn/vpn/policy"
+	"github.com/fisker/zvpn/vpn/util"
 )
 
 const (
@@ -52,15 +54,15 @@ type TunnelClient struct {
 	User            *models.User
 	Conn            net.Conn
 	IP              net.IP
-	VPNServer       *vpn.VPNServer
-	TUNDevice       *vpn.TUNDevice
+	VPNServer       *vpnserver.VPNServer
+	TUNDevice       *vpnserver.TUNDevice
 	parser          *CSTPParser
 	useLittleEndian bool
 	lastDataTime    int64
 	idleTimeout     int64
 }
 
-func NewTunnelClient(user *models.User, conn net.Conn, ip net.IP, vpnServer *vpn.VPNServer, tunDevice *vpn.TUNDevice) *TunnelClient {
+func NewTunnelClient(user *models.User, conn net.Conn, ip net.IP, vpnServer *vpnserver.VPNServer, tunDevice *vpnserver.TUNDevice) *TunnelClient {
 	now := time.Now().Unix()
 	tc := &TunnelClient{
 		User:         user,
@@ -657,8 +659,8 @@ func (tc *TunnelClient) processDataPacket(payload []byte) error {
 	if tc.VPNServer != nil && tc.VPNServer.CompressionMgr != nil {
 		cfg := tc.VPNServer.GetConfig()
 		if cfg != nil && cfg.VPN.EnableCompression {
-			compressionType := vpn.CompressionType(cfg.VPN.CompressionType)
-			if compressionType != vpn.CompressionNone {
+			compressionType := compression.CompressionType(cfg.VPN.CompressionType)
+			if compressionType != compression.CompressionNone {
 				decompressed, err := tc.VPNServer.CompressionMgr.Decompress(payload, compressionType)
 				if err != nil {
 					log.Printf("Warning: Failed to decompress packet from user %s: %v", tc.User.Username, err)
@@ -744,7 +746,7 @@ func (tc *TunnelClient) processDataPacket(payload []byte) error {
 
 			if isVPNInternalTraffic(srcIP, dstIP, ipNet) && !dstIP.Equal(serverVPNIP) {
 
-				vpn.LogPacket("OpenConnect: Direct forwarding packet from client %s to client %s (bypassing TUN device)",
+				util.LogPacket("OpenConnect: Direct forwarding packet from client %s to client %s (bypassing TUN device)",
 					srcIP.String(), dstIP.String())
 
 				if err := tc.performPolicyCheck(payload); err != nil {
@@ -1001,7 +1003,7 @@ func (tc *TunnelClient) sendPacket(packetType byte, data []byte) error {
 	fullPacket := tc.BuildCSTPPacket(packetType, data)
 	payloadLen := uint16(len(data))
 
-	if vpn.ShouldLogPacket() {
+	if util.ShouldLogPacket() {
 
 		log.Printf("OpenConnect: Sending packet to user %s: type=0x%02x, payload length=%d (BIG-ENDIAN at byte 4-5), total packet=%d bytes, first 16 bytes: %x",
 			tc.User.Username, packetType, payloadLen, len(fullPacket), fullPacket[:min(16, len(fullPacket))])

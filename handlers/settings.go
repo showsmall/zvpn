@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/fisker/zvpn/config"
-	"github.com/fisker/zvpn/database"
+	"github.com/fisker/zvpn/internal/database"
 	"github.com/fisker/zvpn/models"
-	"github.com/fisker/zvpn/vpn"
+	vpnserver "github.com/fisker/zvpn/vpn/server"
 	"github.com/fisker/zvpn/vpn/ebpf"
 	"github.com/fisker/zvpn/vpn/policy"
 	"github.com/fisker/zvpn/vpn/security"
@@ -45,7 +45,7 @@ func boolToUint8(b bool) uint8 {
 
 type SettingsHandler struct {
 	config    *config.Config
-	vpnServer *vpn.VPNServer
+	vpnServer *vpnserver.VPNServer
 }
 
 func NewSettingsHandler(cfg *config.Config) *SettingsHandler {
@@ -70,7 +70,7 @@ func NewSettingsHandler(cfg *config.Config) *SettingsHandler {
 	return h
 }
 
-func (h *SettingsHandler) SetVPNServer(server *vpn.VPNServer) {
+func (h *SettingsHandler) SetVPNServer(server *vpnserver.VPNServer) {
 	h.vpnServer = server
 	h.applyPerformanceToRuntime()
 	h.applySecurityToRuntime()

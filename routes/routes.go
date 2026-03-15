@@ -9,11 +9,11 @@ import (
 	"github.com/fisker/zvpn/config"
 	"github.com/fisker/zvpn/handlers"
 	"github.com/fisker/zvpn/middleware"
-	"github.com/fisker/zvpn/vpn"
+	vpnserver "github.com/fisker/zvpn/vpn/server"
 	"github.com/gin-gonic/gin"
 )
 
-func SetupRouter(cfg *config.Config, vpnServer *vpn.VPNServer, certManager handlers.CertificateManager) *gin.Engine {
+func SetupRouter(cfg *config.Config, vpnServer *vpnserver.VPNServer, certManager handlers.CertificateManager) *gin.Engine {
 	gin.SetMode(cfg.Server.Mode)
 
 	router := gin.Default()

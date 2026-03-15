@@ -72,13 +72,10 @@ func (hl *HookLogger) LogPacket(hookName string, ctx *Context, action Action) {
 	logMsg := fmt.Sprintf("[%s] Hook: %s, Action: %s, UserID: %d, Src: %s, Dst: %s, Protocol: %s, SrcPort: %d, DstPort: %d\n",
 		timestamp, hookName, action.String(), ctx.UserID, ctx.SrcIP, ctx.DstIP, ctx.Protocol, ctx.SrcPort, ctx.DstPort)
 
-	// Write to file if available
 	if hl.logFile != nil {
 		hl.logFile.WriteString(logMsg)
-		hl.logFile.Sync() // Ensure immediate write
+		hl.logFile.Sync()
 	}
-
-	// Also log to standard logger
 	log.Printf("HookPolicy: %s", logMsg)
 }
 

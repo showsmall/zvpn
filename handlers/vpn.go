@@ -10,9 +10,10 @@ import (
 	"time"
 
 	"github.com/fisker/zvpn/config"
-	"github.com/fisker/zvpn/database"
+	"github.com/fisker/zvpn/internal/compression"
+	"github.com/fisker/zvpn/internal/database"
 	"github.com/fisker/zvpn/models"
-	"github.com/fisker/zvpn/vpn"
+	vpnserver "github.com/fisker/zvpn/vpn/server"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -23,9 +24,30 @@ const (
 	defaultCompressionType   = "lz4"
 )
 
+type xdpStatsReader interface {
+	GetDetailedStats() (uint64, uint64, error)
+	GetStats() (uint64, error)
+}
+
+type tcStatsReader interface {
+	GetNATStats() (map[uint32]uint64, error)
+}
+
+type ebpfStatsResponse struct {
+	EBPFEnabled                      bool   `json:"ebpf_enabled"`
+	TotalPackets                     uint64 `json:"total_packets"`
+	DroppedPackets                   uint64 `json:"dropped_packets"`
+	TCNATPerformedPackets            uint64 `json:"tc_nat_performed_packets"`
+	TCTotalPackets                   uint64 `json:"tc_total_packets"`
+	TCVPNNetworkNotConfiguredPackets uint64 `json:"tc_vpn_network_not_configured_packets"`
+	Timestamp                        int64  `json:"timestamp,omitempty"`
+}
+
 type VPNHandler struct {
-	config    *config.Config
-	vpnServer *vpn.VPNServer
+	config                *config.Config
+	vpnServer             *vpnserver.VPNServer
+	statsReaderOverride   xdpStatsReader
+	tcStatsReaderOverride tcStatsReader
 }
 
 func NewVPNHandler(cfg *config.Config) *VPNHandler {
@@ -36,9 +58,80 @@ func NewVPNHandler(cfg *config.Config) *VPNHandler {
 	return h
 }
 
-func (h *VPNHandler) SetVPNServer(server *vpn.VPNServer) {
+func (h *VPNHandler) SetVPNServer(server *vpnserver.VPNServer) {
 	h.vpnServer = server
 	h.applyCompressionToRuntime()
+}
+
+func collectEBPFStats(xdpProg xdpStatsReader) ebpfStatsResponse {
+	stats := ebpfStatsResponse{}
+	if xdpProg == nil {
+		return stats
+	}
+
+	stats.EBPFEnabled = true
+
+	total, dropped, err := xdpProg.GetDetailedStats()
+	if err == nil {
+		stats.TotalPackets = total
+		stats.DroppedPackets = dropped
+		return stats
+	}
+
+	log.Printf("Warning: Failed to get detailed eBPF stats: %v, trying basic stats", err)
+	packets, basicErr := xdpProg.GetStats()
+	if basicErr != nil {
+		log.Printf("Warning: Failed to get basic eBPF stats: %v (but eBPF is still enabled)", basicErr)
+		return stats
+	}
+
+	stats.TotalPackets = packets
+	return stats
+}
+
+func collectTCStats(tcProg tcStatsReader, stats *ebpfStatsResponse) {
+	if tcProg == nil {
+		return
+	}
+
+	natStats, err := tcProg.GetNATStats()
+	if err != nil {
+		return
+	}
+
+	stats.EBPFEnabled = true
+	stats.TCNATPerformedPackets = natStats[0]
+	stats.TCTotalPackets = natStats[4]
+	stats.TCVPNNetworkNotConfiguredPackets = natStats[5]
+}
+
+func (h *VPNHandler) getEBPFStatsSnapshot() ebpfStatsResponse {
+	if h.statsReaderOverride != nil || h.tcStatsReaderOverride != nil {
+		stats := collectEBPFStats(h.statsReaderOverride)
+		collectTCStats(h.tcStatsReaderOverride, &stats)
+		return stats
+	}
+
+	if h.vpnServer == nil {
+		log.Printf("VPN server is nil")
+		return ebpfStatsResponse{}
+	}
+
+	stats := collectEBPFStats(h.vpnServer.GetEBPFProgram())
+	if natStats, err := h.vpnServer.GetTCNATStats(); err == nil {
+		stats.EBPFEnabled = true
+		stats.TCNATPerformedPackets = natStats[0]
+		stats.TCTotalPackets = natStats[4]
+		stats.TCVPNNetworkNotConfiguredPackets = natStats[5]
+	}
+
+	return stats
+}
+
+func (h *VPNHandler) writeEBPFStatsEvent(c *gin.Context, timestamp int64) {
+	stats := h.getEBPFStatsSnapshot()
+	stats.Timestamp = timestamp
+	c.SSEvent("stats", stats)
 }
 
 type ConnectRequest struct {
@@ -379,64 +472,7 @@ func (h *VPNHandler) GetConnectedUsers(c *gin.Context) {
 }
 
 func (h *VPNHandler) GetEBPFStats(c *gin.Context) {
-	var totalPackets uint64 = 0
-	var droppedPackets uint64 = 0
-	var ebpfEnabled bool = false
-
-	if h.vpnServer != nil {
-		ebpfProg := h.vpnServer.GetEBPFProgram()
-		if ebpfProg != nil {
-			ebpfEnabled = true
-			log.Printf("eBPF program is loaded, getting stats...")
-			total, dropped, err := ebpfProg.GetDetailedStats()
-			if err == nil {
-				totalPackets = total
-				droppedPackets = dropped
-				log.Printf("eBPF detailed stats retrieved: total=%d, dropped=%d", total, dropped)
-			} else {
-				log.Printf("Warning: Failed to get eBPF detailed stats: %v, trying basic stats", err)
-				packets, err := ebpfProg.GetStats()
-				if err == nil {
-					totalPackets = packets
-					log.Printf("eBPF basic stats retrieved: %d packets", packets)
-				} else {
-					log.Printf("Warning: Failed to get eBPF stats: %v (but eBPF is still enabled)", err)
-				}
-			}
-		} else {
-			log.Printf("eBPF program is nil (not loaded)")
-		}
-	} else {
-		log.Printf("VPN server is nil")
-	}
-
-	avgPacketSize := uint64(0)
-	totalBytes := uint64(0)
-	droppedBytes := uint64(0)
-	filterHits := uint64(0)
-
-	if totalPackets > 0 {
-		avgPacketSize = 64 + (totalPackets % 1000)
-		if avgPacketSize > 1500 {
-			avgPacketSize = 1500
-		}
-		totalBytes = totalPackets * avgPacketSize
-		droppedBytes = droppedPackets * avgPacketSize
-		filterHits = totalPackets / 10
-		if filterHits == 0 && totalPackets > 0 {
-			filterHits = 1 // At least 1 hit if we have packets
-		}
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"ebpf_enabled":    ebpfEnabled,
-		"total_packets":   totalPackets,
-		"dropped_packets": droppedPackets,
-		"total_bytes":     totalBytes,
-		"dropped_bytes":   droppedBytes,
-		"avg_packet_size": avgPacketSize,
-		"filter_hits":     filterHits,
-	})
+	c.JSON(http.StatusOK, h.getEBPFStatsSnapshot())
 }
 
 func (h *VPNHandler) StreamEBPFStats(c *gin.Context) {
@@ -460,55 +496,7 @@ func (h *VPNHandler) StreamEBPFStats(c *gin.Context) {
 		case <-clientGone:
 			return
 		case <-ticker.C:
-			var totalPackets uint64 = 0
-			var droppedPackets uint64 = 0
-			var ebpfEnabled bool = false
-
-			if h.vpnServer != nil && h.vpnServer.GetEBPFProgram() != nil {
-				ebpfEnabled = true
-				ebpfProg := h.vpnServer.GetEBPFProgram()
-				total, dropped, err := ebpfProg.GetDetailedStats()
-				if err == nil {
-					totalPackets = total
-					droppedPackets = dropped
-				} else {
-					packets, err := ebpfProg.GetStats()
-					if err == nil {
-						totalPackets = packets
-					}
-				}
-			}
-
-			avgPacketSize := uint64(0)
-			totalBytes := uint64(0)
-			droppedBytes := uint64(0)
-			filterHits := uint64(0)
-
-			if totalPackets > 0 {
-				avgPacketSize = 64 + (totalPackets % 1000)
-				if avgPacketSize > 1500 {
-					avgPacketSize = 1500
-				}
-				totalBytes = totalPackets * avgPacketSize
-				droppedBytes = droppedPackets * avgPacketSize
-				filterHits = totalPackets / 10
-				if filterHits == 0 && totalPackets > 0 {
-					filterHits = 1 // At least 1 hit if we have packets
-				}
-			}
-
-			stats := gin.H{
-				"ebpf_enabled":    ebpfEnabled,
-				"total_packets":   totalPackets,
-				"dropped_packets": droppedPackets,
-				"total_bytes":     totalBytes,
-				"dropped_bytes":   droppedBytes,
-				"avg_packet_size": avgPacketSize,
-				"filter_hits":     filterHits,
-				"timestamp":       time.Now().Unix(),
-			}
-
-			c.SSEvent("stats", stats)
+			h.writeEBPFStatsEvent(c, time.Now().Unix())
 			c.Writer.Flush()
 		}
 	}
@@ -543,11 +531,11 @@ func (h *VPNHandler) UpdateCompressionConfig(c *gin.Context) {
 	h.config.VPN.CompressionType = req.CompressionType
 
 	if h.vpnServer != nil {
-		compressionType := vpn.CompressionType(req.CompressionType)
-		if req.EnableCompression && compressionType != vpn.CompressionNone {
-			h.vpnServer.CompressionMgr = vpn.NewCompressionManager(compressionType)
+		compressionType := compression.CompressionType(req.CompressionType)
+		if req.EnableCompression && compressionType != compression.CompressionNone {
+			h.vpnServer.CompressionMgr = compression.NewCompressionManager(compressionType)
 		} else {
-			h.vpnServer.CompressionMgr = vpn.NewCompressionManager(vpn.CompressionNone)
+			h.vpnServer.CompressionMgr = compression.NewCompressionManager(compression.CompressionNone)
 		}
 	}
 
@@ -558,7 +546,6 @@ func (h *VPNHandler) UpdateCompressionConfig(c *gin.Context) {
 
 	c.JSON(http.StatusOK, config)
 }
-
 
 const compressionSettingKey = "compression_settings"
 
@@ -598,11 +585,10 @@ func (h *VPNHandler) applyCompressionToRuntime() {
 	if h.vpnServer == nil {
 		return
 	}
-	compType := vpn.CompressionType(h.config.VPN.CompressionType)
-	if h.config.VPN.EnableCompression && compType != vpn.CompressionNone {
-		h.vpnServer.CompressionMgr = vpn.NewCompressionManager(compType)
+	compType := compression.CompressionType(h.config.VPN.CompressionType)
+	if h.config.VPN.EnableCompression && compType != compression.CompressionNone {
+		h.vpnServer.CompressionMgr = compression.NewCompressionManager(compType)
 	} else {
-		h.vpnServer.CompressionMgr = vpn.NewCompressionManager(vpn.CompressionNone)
+		h.vpnServer.CompressionMgr = compression.NewCompressionManager(compression.CompressionNone)
 	}
 }
-

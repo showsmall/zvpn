@@ -256,6 +256,7 @@ func setDefaults() {
 	viper.SetDefault("ldap.userfilter", "(uid=%s)")
 	viper.SetDefault("ldap.admingroup", "")
 	viper.SetDefault("ldap.skiptlsverify", false)
+
 }
 
 func validateConfig(cfg *Config) error {
@@ -311,11 +312,9 @@ func printConfigSummary(cfg *Config) {
 	}
 	log.Printf("数据库: %s", cfg.Database.Type)
 	log.Printf("VPN 网段: %s", cfg.VPN.Network)
-
 	log.Printf("LDAP 认证: %v", cfg.LDAP.Enabled)
 	if cfg.LDAP.Enabled {
 		log.Printf("LDAP 服务器: %s:%d", cfg.LDAP.Host, cfg.LDAP.Port)
 	}
 	log.Println("==================================================")
 }
-

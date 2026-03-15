@@ -4,10 +4,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/fisker/zvpn/config"
-	"github.com/fisker/zvpn/database"
+	"github.com/fisker/zvpn/internal/database"
 	"github.com/fisker/zvpn/models"
 	"github.com/fisker/zvpn/vpn/ebpf"
 )
@@ -114,8 +115,7 @@ func RemovePolicyHooks(manager *Manager, userID uint) error {
 	for hookPoint, hooks := range allHooks {
 		for _, hook := range hooks {
 			hookName := hook.Name()
-			// Check if hook belongs to this user
-			if len(hookName) > 5 && hookName[:5] == fmt.Sprintf("user_%d_", userID) {
+			if strings.HasPrefix(hookName, fmt.Sprintf("user_%d_", userID)) {
 				if err := manager.UnregisterHook(hookName, hookPoint); err != nil {
 					log.Printf("Failed to unregister hook %s: %v", hookName, err)
 				}
@@ -134,10 +134,9 @@ func loadHooksFromDB(manager *Manager) error {
 
 	for _, hookModel := range hooks {
 		if !hookModel.Enabled {
-			continue // Skip disabled hooks
+			continue
 		}
-
-		hook := convertModelHookToPolicyHook(&hookModel)
+		hook := ConvertModelHookToPolicyHook(&hookModel)
 		if hook == nil {
 			log.Printf("Failed to convert hook %s to policy hook", hookModel.ID)
 			continue
@@ -152,9 +151,4 @@ func loadHooksFromDB(manager *Manager) error {
 	}
 
 	return nil
-}
-
-// convertModelHookToPolicyHook uses the shared converter
-func convertModelHookToPolicyHook(hookModel *models.Hook) Hook {
-	return ConvertModelHookToPolicyHook(hookModel)
 }

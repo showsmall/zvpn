@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/fisker/zvpn/config"
-	"github.com/fisker/zvpn/database"
+	"github.com/fisker/zvpn/internal/database"
 	"github.com/fisker/zvpn/models"
 	"github.com/fisker/zvpn/vpn/policy"
 	"github.com/gin-gonic/gin"

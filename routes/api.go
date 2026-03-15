@@ -4,11 +4,11 @@ import (
 	"github.com/fisker/zvpn/config"
 	"github.com/fisker/zvpn/handlers"
 	"github.com/fisker/zvpn/middleware"
-	"github.com/fisker/zvpn/vpn"
+	vpnserver "github.com/fisker/zvpn/vpn/server"
 	"github.com/gin-gonic/gin"
 )
 
-func RegisterAPIRoutes(router *gin.Engine, cfg *config.Config, vpnServer *vpn.VPNServer, certManager handlers.CertificateManager) {
+func RegisterAPIRoutes(router *gin.Engine, cfg *config.Config, vpnServer *vpnserver.VPNServer, certManager handlers.CertificateManager) {
 	authHandler := handlers.NewAuthHandler(cfg, vpnServer)
 	userHandler := handlers.NewUserHandler(cfg)
 	policyHandler := handlers.NewPolicyHandler(cfg)

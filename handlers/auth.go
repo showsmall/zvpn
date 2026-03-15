@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fisker/zvpn/auth"
 	"github.com/fisker/zvpn/config"
-	"github.com/fisker/zvpn/database"
+	"github.com/fisker/zvpn/internal/auth"
+	"github.com/fisker/zvpn/internal/database"
+	"github.com/fisker/zvpn/internal/utils"
 	"github.com/fisker/zvpn/models"
-	"github.com/fisker/zvpn/vpn/ebpf"
 	"github.com/fisker/zvpn/vpn/policy"
 	"github.com/fisker/zvpn/vpn/security"
 	"github.com/gin-gonic/gin"
@@ -45,41 +45,17 @@ func NewAuthHandler(cfg *config.Config, vpnServer interface{}) *AuthHandler {
 		log.Println("LDAP authentication enabled")
 	}
 
-	var bruteforceProtection *security.BruteforceProtection
-	if vpnServer != nil {
-		if vs, ok := vpnServer.(interface{ GetBruteforceProtection() interface{} }); ok {
-			if bpInterface := vs.GetBruteforceProtection(); bpInterface != nil {
-				if bp, ok := bpInterface.(*security.BruteforceProtection); ok {
-					bruteforceProtection = bp
-					log.Printf("AuthHandler: Using shared bruteforce protection instance from VPNServer")
-				}
-			}
-		}
-	}
-
-	if bruteforceProtection == nil && cfg.VPN.EnableBruteforceProtection {
-		maxAttempts := cfg.VPN.MaxLoginAttempts
-		if maxAttempts <= 0 {
-			maxAttempts = 5 // 默认值
-		}
-		lockoutDuration := time.Duration(cfg.VPN.LoginLockoutDuration) * time.Second
-		if lockoutDuration <= 0 {
-			lockoutDuration = 15 * time.Minute // 默认15分钟
-		}
-		windowDuration := time.Duration(cfg.VPN.LoginAttemptWindow) * time.Second
-		if windowDuration <= 0 {
-			windowDuration = 5 * time.Minute // 默认5分钟
-		}
-		bruteforceProtection = security.NewBruteforceProtection(maxAttempts, lockoutDuration, windowDuration)
+	// 首先尝试从 VPNServer 获取已有的 BruteforceProtection 实例
+	bruteforceProtection := utils.TryGetBruteforceProtectionFromVPNServer(vpnServer)
+	if bruteforceProtection != nil {
+		log.Printf("AuthHandler: Using shared bruteforce protection instance from VPNServer")
+	} else if cfg.VPN.EnableBruteforceProtection {
+		// 如果没有则创建新的实例
+		initializer := utils.NewBruteforceProtectionInitializer(cfg)
 		if vpnServer != nil {
-			if vs, ok := vpnServer.(interface{ GetEBPFProgram() *ebpf.XDPProgram }); ok {
-				if ebpfProg := vs.GetEBPFProgram(); ebpfProg != nil {
-					bruteforceProtection.SetEBPFProgram(ebpfProg)
-				}
-			}
+			initializer.SetEBPFProgram(utils.TryGetEBPFProgramFromVPNServer(vpnServer))
 		}
-		log.Printf("AuthHandler: Bruteforce protection enabled: max attempts=%d, lockout=%v, window=%v",
-			maxAttempts, lockoutDuration, windowDuration)
+		bruteforceProtection = initializer.Initialize("AuthHandler")
 	}
 
 	return &AuthHandler{
@@ -536,4 +512,3 @@ func (h *AuthHandler) verifyPasswordToken(token string, username string) bool {
 
 	return hmac.Equal([]byte(signature), []byte(expectedSignature))
 }
-

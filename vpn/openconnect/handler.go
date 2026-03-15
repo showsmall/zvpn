@@ -13,17 +13,17 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/fisker/zvpn/auth"
 	"github.com/fisker/zvpn/config"
-	"github.com/fisker/zvpn/database"
-	"github.com/fisker/zvpn/handlers"
+	"github.com/fisker/zvpn/internal/auth"
+	"github.com/fisker/zvpn/internal/configutil"
+	"github.com/fisker/zvpn/internal/database"
+	"github.com/fisker/zvpn/internal/utils"
 	"github.com/fisker/zvpn/models"
-	"github.com/fisker/zvpn/vpn"
 	"github.com/fisker/zvpn/vpn/policy"
 	"github.com/fisker/zvpn/vpn/security"
+	vpnserver "github.com/fisker/zvpn/vpn/server"
 	"github.com/gin-gonic/gin"
 )
 
@@ -38,13 +38,12 @@ type DTLSClientInfo struct {
 
 type Handler struct {
 	config               *config.Config
-	vpnServer            *vpn.VPNServer
+	vpnServer            *vpnserver.VPNServer
 	ldapAuthenticator    *auth.LDAPAuthenticator
-	tunDevice            *vpn.TUNDevice
+	tunDevice            *vpnserver.TUNDevice
 	dtlsListener         net.Listener
 	dtlsRawUDPConn       *net.UDPConn
-	dtlsClients          map[string]*DTLSClientInfo
-	dtlsLock             sync.RWMutex
+	dtlsManager          *DTLSClientManager // 使用优化的 DTLS 客户端管理器
 	dtlsSessionStore     *dtlsSessionStore
 	bruteforceProtection *security.BruteforceProtection
 }
@@ -131,7 +130,7 @@ func getHeaderCaseInsensitive(c *gin.Context, names ...string) string {
 	return ""
 }
 
-func NewHandler(cfg *config.Config, vpnServer *vpn.VPNServer) *Handler {
+func NewHandler(cfg *config.Config, vpnServer *vpnserver.VPNServer) *Handler {
 	var ldapAuth *auth.LDAPAuthenticator
 	if cfg.LDAP.Enabled {
 		ldapConfig := &auth.LDAPConfig{
@@ -147,45 +146,24 @@ func NewHandler(cfg *config.Config, vpnServer *vpn.VPNServer) *Handler {
 		ldapAuth = auth.NewLDAPAuthenticator(ldapConfig)
 	}
 
-	var bruteforceProtection *security.BruteforceProtection
-	if vpnServer != nil {
-		if bpInterface := vpnServer.GetBruteforceProtection(); bpInterface != nil {
-			if bp, ok := bpInterface.(*security.BruteforceProtection); ok {
-				bruteforceProtection = bp
-				log.Printf("OpenConnect: Using shared bruteforce protection instance from VPNServer")
-			}
-		}
-	}
-
-	if bruteforceProtection == nil && cfg.VPN.EnableBruteforceProtection {
-		maxAttempts := cfg.VPN.MaxLoginAttempts
-		if maxAttempts <= 0 {
-			maxAttempts = 5
-		}
-		lockoutDuration := time.Duration(cfg.VPN.LoginLockoutDuration) * time.Second
-		if lockoutDuration <= 0 {
-			lockoutDuration = 15 * time.Minute
-		}
-		windowDuration := time.Duration(cfg.VPN.LoginAttemptWindow) * time.Second
-		if windowDuration <= 0 {
-			windowDuration = 5 * time.Minute
-		}
-		bruteforceProtection = security.NewBruteforceProtection(maxAttempts, lockoutDuration, windowDuration)
-
+	// 首先尝试从 VPNServer 获取已有的 BruteforceProtection 实例
+	bruteforceProtection := utils.TryGetBruteforceProtectionFromVPNServer(vpnServer)
+	if bruteforceProtection != nil {
+		log.Printf("OpenConnect: Using shared bruteforce protection instance from VPNServer")
+	} else if cfg.VPN.EnableBruteforceProtection {
+		// 如果没有则创建新的实例
+		initializer := utils.NewBruteforceProtectionInitializer(cfg)
 		if vpnServer != nil {
-			if ebpfProg := vpnServer.GetEBPFProgram(); ebpfProg != nil {
-				bruteforceProtection.SetEBPFProgram(ebpfProg)
-			}
+			initializer.SetEBPFProgram(utils.TryGetEBPFProgramFromVPNServer(vpnServer))
 		}
-		log.Printf("OpenConnect: Bruteforce protection enabled: max attempts=%d, lockout=%v, window=%v",
-			maxAttempts, lockoutDuration, windowDuration)
+		bruteforceProtection = initializer.Initialize("OpenConnect")
 	}
 
 	handler := &Handler{
 		config:               cfg,
 		vpnServer:            vpnServer,
 		ldapAuthenticator:    ldapAuth,
-		dtlsClients:          make(map[string]*DTLSClientInfo),
+		dtlsManager:          NewDTLSClientManager(),
 		bruteforceProtection: bruteforceProtection,
 	}
 
@@ -484,15 +462,13 @@ func (h *Handler) handleConnect(c *gin.Context) {
 		strings.Contains(userAgentLower, "ios")
 
 	if h.config.VPN.EnableDTLS {
-		h.dtlsLock.Lock()
-		h.dtlsClients[user.VPNIP] = &DTLSClientInfo{
+		h.dtlsManager.Add(user.VPNIP, &DTLSClientInfo{
 			Client:   tunnelClient,
 			UDPAddr:  nil,
 			DTLSConn: nil,
 			LastSeen: time.Now(),
 			IsMobile: isMobile, // 保存移动端标识
-		}
-		h.dtlsLock.Unlock()
+		})
 	}
 
 	bufferSize := 100
@@ -502,7 +478,7 @@ func (h *Handler) handleConnect(c *gin.Context) {
 		}
 	}
 
-	vpnClient := &vpn.VPNClient{
+	vpnClient := &vpnserver.VPNClient{
 		UserID:     user.ID,
 		User:       &user,
 		Conn:       conn,
@@ -652,8 +628,8 @@ func (h *Handler) handleConnect(c *gin.Context) {
 	h.vpnServer.UnregisterClient(user.ID, user.VPNIP)
 
 	if h.config.VPN.EnableDTLS {
-		h.dtlsLock.Lock()
-		clientInfo, exists := h.dtlsClients[user.VPNIP]
+		// DTLS locking handled by manager
+		clientInfo, exists := h.dtlsManager.GetByVPNIP(user.VPNIP)
 		if exists && clientInfo != nil {
 
 			if clientInfo.DTLSConn != nil {
@@ -676,8 +652,8 @@ func (h *Handler) handleConnect(c *gin.Context) {
 				client.DTLSConn = nil
 			}
 		}
-		delete(h.dtlsClients, user.VPNIP)
-		h.dtlsLock.Unlock()
+		h.dtlsManager.Remove(user.VPNIP)
+		// DTLS unlocking handled by manager
 		log.Printf("OpenConnect: Unregistered DTLS client for user %s (VPN IP: %s)", user.Username, user.VPNIP)
 	}
 
@@ -704,253 +680,118 @@ func (h *Handler) handleConnect(c *gin.Context) {
 }
 
 func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []string, clientCipherSuite string, clientMasterSecret string, clientType ClientType, c *gin.Context) error {
-
+	// 解析网络配置
 	_, ipNet, err := net.ParseCIDR(h.config.VPN.Network)
 	if err != nil {
 		return err
 	}
-
 	netmask := net.IP(ipNet.Mask).String()
-
 	tunnelMode := getUserTunnelMode(user)
 
-
-	response := "HTTP/1.1 200 OK\r\n"
-	response += "Content-Type: application/octet-stream\r\n"
-
-	response += "Connection: keep-alive\r\n"
-
-	hostname := handlers.GetVPNProfileName()
+	// 获取主机名
+	hostname := configutil.GetVPNProfileName()
 	if hostname == "" {
 		hostname = "zvpn"
 	}
 
+	// 检测是否为移动端
+	isMobile := h.detectMobileClient(c)
+	mobileConfig := CalculateMobileConfig(h.config, isMobile)
+
+	// 计算 DTLS 会话配置
+	dtlsConfig := h.calculateDTLSConfig(clientCipherSuite, clientMasterSecret, mobileConfig)
+
+	// 计算路由配置
+	routeCalculator := NewRouteCalculator(h.config, user, tunnelMode, dnsServers)
+	splitIncludeRoutes, splitExcludeRoutes := routeCalculator.CalculateRoutes()
+
+	// 计算 Split-DNS 配置
+	splitDNSDomains := h.calculateSplitDNS(user)
+
+	// 获取编码信息
 	cstpAcceptEncoding := getHeaderCaseInsensitive(c, "X-Cstp-Accept-Encoding", "X-CSTP-Accept-Encoding")
 	dtlsAcceptEncoding := getHeaderCaseInsensitive(c, "X-Dtls-Accept-Encoding", "X-DTLS-Accept-Encoding")
 
-	response += "Server: ZVPN 1.0\r\n"
-	response += "X-CSTP-Version: 1\r\n"
-	response += "X-CSTP-Server-Name: ZVPN 1.0\r\n"
-	response += "X-CSTP-Protocol: Copyright (c) 2004 Cisco Systems, Inc.\r\n"
-	response += "X-CSTP-Address: " + user.VPNIP + "\r\n"
-	response += "X-CSTP-Netmask: " + netmask + "\r\n"
-	response += "X-CSTP-Hostname: " + hostname + "\r\n"
+	// 构建响应
+	builder := NewCSTPConfigBuilder(h.config, user, tunnelMode, netmask, isMobile)
+	builder.BuildBasicHeaders(hostname)
+	builder.AddCompressionHeaders(cstpAcceptEncoding, dtlsAcceptEncoding)
+	builder.AddMTUHeader(h.config.VPN.MTU)
+	builder.AddKeepaliveHeaders(mobileConfig.DPD, mobileConfig.Keepalive)
+	builder.AddDTLSHeaders(dtlsConfig.SessionID, dtlsConfig.Port, dtlsConfig.DPDStr, dtlsConfig.KeepaliveStr, dtlsConfig.CipherSuiteHeader)
+	builder.AddDNSHeaders(dnsServers)
+	builder.AddSplitDNSHeaders(splitDNSDomains)
+	builder.AddRouteHeaders(splitIncludeRoutes, splitExcludeRoutes)
+	builder.AddFixedHeaders()
 
-	response += "X-CSTP-Base-MTU: " + strconv.Itoa(h.config.VPN.MTU) + "\r\n"
+	response := builder.String()
 
+	// 日志输出
+	log.Printf("OpenConnect: ========== CSTP Config XML for user %s (VPN IP: %s) ==========", user.Username, user.VPNIP)
+	log.Printf("OpenConnect: %s", response)
+	log.Printf("OpenConnect: ========== End of CSTP Config XML ==========")
 
-	if h.config.VPN.EnableCompression && cstpAcceptEncoding != "" {
-		compressionType := getCompressionType(h.config)
-		if compressionType != "none" {
-			if strings.Contains(strings.ToLower(cstpAcceptEncoding), strings.ToLower(compressionType)) {
-				response += "X-CSTP-Content-Encoding: " + compressionType + "\r\n"
-			}
-		}
-	}
-	if h.config.VPN.EnableCompression && dtlsAcceptEncoding != "" {
-		compressionType := getCompressionType(h.config)
-		if compressionType != "none" {
-			if strings.Contains(strings.ToLower(dtlsAcceptEncoding), strings.ToLower(compressionType)) {
-				response += "X-DTLS-Content-Encoding: " + compressionType + "\r\n"
-			}
-		}
+	// 发送响应
+	if _, err = conn.Write([]byte(response)); err != nil {
+		log.Printf("OpenConnect: ERROR - Failed to write CSTP config to connection: %v", err)
+		return fmt.Errorf("failed to write CSTP config: %w", err)
 	}
 
+	log.Printf("OpenConnect: CSTP config sent successfully for user %s (IP: %s, MTU: %d)", user.Username, user.VPNIP, h.config.VPN.MTU)
+	return nil
+}
+
+// detectMobileClient 检测是否为移动端客户端
+func (h *Handler) detectMobileClient(c *gin.Context) bool {
 	mobileLicense := getHeaderCaseInsensitive(c, "X-Cstp-License", "X-CSTP-License")
 	userAgent := strings.ToLower(c.GetHeader("User-Agent"))
-	isMobile := mobileLicense == "mobile" ||
+	return mobileLicense == "mobile" ||
 		strings.Contains(userAgent, "android") ||
 		strings.Contains(userAgent, "iphone") ||
 		strings.Contains(userAgent, "ipad") ||
 		strings.Contains(userAgent, "ios")
+}
 
-	var cstpDPD, cstpKeepalive int
-	if isMobile {
-		cstpDPD = h.config.VPN.MobileDPD
-		cstpKeepalive = h.config.VPN.MobileKeepalive
-		if cstpDPD == 0 {
-			cstpDPD = 60
-		}
-		if cstpKeepalive == 0 {
-			cstpKeepalive = 4
-		}
-	} else {
-		cstpDPD = h.config.VPN.CSTPDPD
-		cstpKeepalive = h.config.VPN.CSTPKeepalive
-		if cstpDPD == 0 {
-			cstpDPD = 30
-		}
-		if cstpKeepalive == 0 {
-			cstpKeepalive = 20
+// calculateDTLSConfig 计算 DTLS 配置
+func (h *Handler) calculateDTLSConfig(clientCipherSuite, clientMasterSecret string, mobileConfig MobileConfig) DTLSSessionConfig {
+	config := DTLSSessionConfig{}
+	if !h.config.VPN.EnableDTLS {
+		return config
+	}
+
+	// 生成 Session ID
+	sessionIDBytes := make([]byte, 32)
+	if _, err := rand.Read(sessionIDBytes); err != nil {
+		log.Printf("OpenConnect: Warning - Failed to generate DTLS session ID: %v", err)
+		sessionIDBytes = make([]byte, 32)
+	}
+	config.SessionID = hex.EncodeToString(sessionIDBytes)
+
+	// 设置端口
+	config.Port = h.config.VPN.OpenConnectPort
+	if h.config.VPN.DTLSPort != "" && h.config.VPN.DTLSPort != h.config.VPN.OpenConnectPort {
+		config.Port = h.config.VPN.DTLSPort
+	}
+
+	// 设置 DPD 和 Keepalive
+	config.DPDStr = strconv.Itoa(mobileConfig.DPD)
+	config.KeepaliveStr = strconv.Itoa(mobileConfig.Keepalive)
+
+	// 设置 Cipher Suite
+	config.CipherSuiteHeader = checkDtls12Ciphersuite(clientCipherSuite)
+
+	// 存储 Master Secret
+	if clientMasterSecret != "" && h.dtlsSessionStore != nil {
+		if err := h.dtlsSessionStore.StoreMasterSecret(config.SessionID, clientMasterSecret); err != nil {
+			log.Printf("OpenConnect: Failed to store master secret: %v", err)
 		}
 	}
 
-	var dtlsSessionID string
-	var dtlsPort string
-	var dtlsDPDStr, dtlsKeepaliveStr string
-	var cipherSuiteHeader string
-	if h.config.VPN.EnableDTLS {
-		sessionIDBytes := make([]byte, 32)
-		if _, err := rand.Read(sessionIDBytes); err != nil {
-			log.Printf("OpenConnect: Warning - Failed to generate DTLS session ID: %v", err)
-			sessionIDBytes = make([]byte, 32)
-		}
-		dtlsSessionID = hex.EncodeToString(sessionIDBytes)
+	return config
+}
 
-		dtlsPort = h.config.VPN.OpenConnectPort
-		if h.config.VPN.DTLSPort != "" && h.config.VPN.DTLSPort != h.config.VPN.OpenConnectPort {
-			dtlsPort = h.config.VPN.DTLSPort
-		}
-
-		dtlsDPDStr = strconv.Itoa(cstpDPD)
-		dtlsKeepaliveStr = strconv.Itoa(cstpKeepalive)
-
-		cipherSuiteHeader = checkDtls12Ciphersuite(clientCipherSuite)
-
-		if clientMasterSecret != "" && h.dtlsSessionStore != nil {
-			if err := h.dtlsSessionStore.StoreMasterSecret(dtlsSessionID, clientMasterSecret); err != nil {
-				log.Printf("OpenConnect: Failed to store master secret: %v", err)
-			}
-		}
-	}
-
-	var splitIncludeRoutes []string
-	var splitExcludeRoutes []string
-	routeMap := make(map[string]bool)        // 用于去重 split-include 路由
-	excludeRouteMap := make(map[string]bool) // 用于去重 split-exclude 路由
-
-	if tunnelMode != "full" && len(dnsServers) > 0 {
-		for _, dns := range dnsServers {
-			if dns == "" {
-				continue
-			}
-			dns = strings.TrimSpace(dns)
-			dnsIP := net.ParseIP(dns)
-			if dnsIP == nil {
-				continue
-			}
-
-			if isPrivateIP(dnsIP) {
-				dnsNetwork := getDNSServerNetwork(dnsIP)
-				if dnsNetwork != "" {
-					if dnsNetwork == h.config.VPN.Network {
-						continue
-					}
-					if !routeMap[dnsNetwork] {
-						routeMap[dnsNetwork] = true
-						splitIncludeRoutes = append(splitIncludeRoutes, dnsNetwork)
-					}
-				}
-			}
-		}
-	}
-
-	if user.PolicyID != 0 && len(user.Policy.Routes) > 0 {
-		for _, route := range user.Policy.Routes {
-			if route.Network == "" {
-				continue
-			}
-
-			normalizedRoute, _, err := parseRouteNetwork(route.Network)
-			if err != nil {
-				log.Printf("OpenConnect: WARNING - Invalid route format '%s' for user %s: %v (skipping)", route.Network, user.Username, err)
-				continue
-			}
-
-			if normalizedRoute == h.config.VPN.Network {
-				continue
-			}
-
-			if normalizedRoute == "0.0.0.0/0" {
-				log.Printf("OpenConnect: WARNING - Default route (0.0.0.0/0) is not allowed in split mode for user %s (skipping)", user.Username)
-				continue
-			}
-
-			if !routeMap[normalizedRoute] {
-				routeMap[normalizedRoute] = true
-				splitIncludeRoutes = append(splitIncludeRoutes, normalizedRoute)
-			}
-		}
-	}
-
-	if tunnelMode == "full" {
-		userPolicy := user.GetPolicy()
-		if userPolicy != nil && len(userPolicy.ExcludeRoutes) > 0 {
-			for _, excludeRoute := range userPolicy.ExcludeRoutes {
-				if excludeRoute.Network == "" {
-					continue
-				}
-
-				normalizedRoute, _, err := parseRouteNetwork(excludeRoute.Network)
-				if err != nil {
-					log.Printf("OpenConnect: Invalid exclude route '%s' for user %s: %v (skipping)", excludeRoute.Network, user.Username, err)
-					continue
-				}
-
-				if excludeRoute.Network == "0.0.0.0/255.255.255.255" {
-					if !excludeRouteMap[excludeRoute.Network] {
-						excludeRouteMap[excludeRoute.Network] = true
-						splitExcludeRoutes = append(splitExcludeRoutes, excludeRoute.Network)
-						log.Printf("OpenConnect: Added exclude route '%s' (allow_lan format) for user %s in full tunnel mode", excludeRoute.Network, user.Username)
-					}
-				} else {
-					if !excludeRouteMap[normalizedRoute] {
-						excludeRouteMap[normalizedRoute] = true
-						splitExcludeRoutes = append(splitExcludeRoutes, normalizedRoute)
-						log.Printf("OpenConnect: Added exclude route '%s' (normalized from '%s') for user %s in full tunnel mode", normalizedRoute, excludeRoute.Network, user.Username)
-					}
-				}
-			}
-		}
-	}
-
-	allowLan := false
-	for _, group := range user.Groups {
-		if group.AllowLan {
-			allowLan = true
-			break
-		}
-	}
-
-	if allowLan {
-		allowLanRoute := "0.0.0.0/255.255.255.255"
-		if !excludeRouteMap[allowLanRoute] {
-			excludeRouteMap[allowLanRoute] = true
-			splitExcludeRoutes = append([]string{allowLanRoute}, splitExcludeRoutes...)
-			log.Printf("OpenConnect: Auto-added allow_lan route (0.0.0.0/255.255.255.255) for user %s (group allow_lan enabled)", user.Username)
-		} else {
-			log.Printf("OpenConnect: allow_lan route (0.0.0.0/255.255.255.255) already configured in policy for user %s", user.Username)
-			var filteredRoutes []string
-			for _, route := range splitExcludeRoutes {
-				if route != allowLanRoute {
-					filteredRoutes = append(filteredRoutes, route)
-				}
-			}
-			splitExcludeRoutes = append([]string{allowLanRoute}, filteredRoutes...)
-		}
-	}
-
-	hasDNS := false
-	for _, dns := range dnsServers {
-		if dns != "" {
-			dns = strings.TrimSpace(dns)
-
-			if ip := net.ParseIP(dns); ip != nil {
-				response += "X-CSTP-DNS: " + dns + "\r\n"
-				hasDNS = true
-			} else {
-				log.Printf("OpenConnect: WARNING - Invalid DNS format '%s', skipping", dns)
-			}
-		}
-	}
-
-	if !hasDNS {
-		defaultDNS := "114.114.114.114"
-		response += "X-CSTP-DNS: " + defaultDNS + "\r\n"
-		log.Printf("OpenConnect: Added default DNS (%s) for user %s in %s tunnel mode (no DNS configured)", defaultDNS, user.Username, tunnelMode)
-		hasDNS = true
-	}
-
+// calculateSplitDNS 计算 Split-DNS 配置
+func (h *Handler) calculateSplitDNS(user *models.User) []string {
 	defaultSplitDNS := "ZVPN.local"
 	splitDNSDomains := []string{}
 
@@ -968,104 +809,22 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 		log.Printf("OpenConnect: Using default Split-DNS domain '%s' for user %s", defaultSplitDNS, user.Username)
 	}
 
-	for _, domain := range splitDNSDomains {
-		domain = strings.TrimSpace(domain)
-		if domain != "" {
-			response += "X-CSTP-Split-DNS: " + domain + "\r\n"
-			log.Printf("OpenConnect: Added Split-DNS domain '%s' for user %s", domain, user.Username)
-		}
-	}
-	log.Printf("OpenConnect: Added %d Split-DNS domains for user %s", len(splitDNSDomains), user.Username)
+	return splitDNSDomains
+}
 
-	if tunnelMode != "full" {
-		if len(splitIncludeRoutes) > 0 {
-			optimizedRoutes := optimizeRoutes(splitIncludeRoutes)
-			for _, route := range optimizedRoutes {
-				routeFormatted := convertCIDRToSubnetMask(route)
-				response += "X-CSTP-Split-Include: " + routeFormatted + "\r\n"
+// hasDefaultDNS 检查是否有 DNS 配置，如果没有则添加默认 DNS
+func (h *Handler) hasDefaultDNS(dnsServers []string) string {
+	for _, dns := range dnsServers {
+		if dns != "" && strings.TrimSpace(dns) != "" {
+			if ip := net.ParseIP(strings.TrimSpace(dns)); ip != nil {
+				return dns
 			}
 		}
-
-		if !allowLan && len(splitExcludeRoutes) > 0 {
-			log.Printf("OpenConnect: WARNING - ExcludeRoutes found in split tunnel mode for user %s, ignoring (split-include and split-exclude cannot be sent together for mobile clients)", user.Username)
-		}
 	}
-
-	if tunnelMode == "full" {
-		if len(splitExcludeRoutes) > 0 {
-			optimizedExcludeRoutes := optimizeRoutes(splitExcludeRoutes)
-			for _, route := range optimizedExcludeRoutes {
-				routeFormatted := convertCIDRToSubnetMask(route)
-				response += "X-CSTP-Split-Exclude: " + routeFormatted + "\r\n"
-			}
-		}
-		if len(splitIncludeRoutes) > 0 {
-			log.Printf("OpenConnect: WARNING - Routes found in full tunnel mode for user %s, ignoring (split-include and split-exclude cannot be sent together)", user.Username)
-		}
-	}
-
-	response += "X-CSTP-Lease-Duration: 1209600\r\n"
-	response += "X-CSTP-Session-Timeout: none\r\n"
-	response += "X-CSTP-Session-Timeout-Alert-Interval: 60\r\n"
-	response += "X-CSTP-Session-Timeout-Remaining: none\r\n"
-	response += "X-CSTP-Idle-Timeout: 18000\r\n"
-	response += "X-CSTP-Disconnected-Timeout: 18000\r\n"
-	response += "X-CSTP-Keep: true\r\n"
-
-	response += "X-CSTP-Tunnel-All-DNS: false\r\n"
-
-	response += "X-CSTP-Rekey-Time: 86400\r\n"
-	response += "X-CSTP-Rekey-Method: new-tunnel\r\n"
-	if h.config.VPN.EnableDTLS {
-		response += "X-DTLS-Rekey-Time: 86400\r\n"
-		response += "X-DTLS-Rekey-Method: new-tunnel\r\n"
-	}
-
-	response += fmt.Sprintf("X-CSTP-DPD: %d\r\n", cstpDPD)
-	response += fmt.Sprintf("X-CSTP-Keepalive: %d\r\n", cstpKeepalive)
-
-	response += "X-CSTP-MSIE-Proxy-Lockdown: true\r\n"
-	response += "X-CSTP-Smartcard-Removal-Disconnect: true\r\n"
-
-	response += "X-CSTP-MTU: " + strconv.Itoa(h.config.VPN.MTU) + "\r\n"
-	if h.config.VPN.EnableDTLS {
-		response += "X-DTLS-MTU: " + strconv.Itoa(h.config.VPN.MTU) + "\r\n"
-	}
-
-	if h.config.VPN.EnableDTLS {
-		response += "X-DTLS-Session-ID: " + dtlsSessionID + "\r\n"
-		response += "X-DTLS-Port: " + dtlsPort + "\r\n"
-		response += "X-DTLS-DPD: " + dtlsDPDStr + "\r\n"
-		response += "X-DTLS-Keepalive: " + dtlsKeepaliveStr + "\r\n"
-		response += "X-DTLS12-CipherSuite: " + cipherSuiteHeader + "\r\n"
-	}
-
-	response += "X-CSTP-License: accept\r\n"
-
-	response += "X-CSTP-Routing-Filtering-Ignore: false\r\n"
-	response += "X-CSTP-Quarantine: false\r\n"
-	response += "X-CSTP-Disable-Always-On-VPN: false\r\n"
-	response += "X-CSTP-Client-Bypass-Protocol: true\r\n"
-	response += "X-CSTP-TCP-Keepalive: false\r\n"
-
-	response += "X-Cisco-Client-Compat: 1\r\n"
-	response += "\r\n"
-
-	log.Printf("OpenConnect: ========== CSTP Config XML for user %s (VPN IP: %s) ==========", user.Username, user.VPNIP)
-	log.Printf("OpenConnect: %s", response)
-	log.Printf("OpenConnect: ========== End of CSTP Config XML ==========")
-
-	if _, err = conn.Write([]byte(response)); err != nil {
-		log.Printf("OpenConnect: ERROR - Failed to write CSTP config to connection: %v", err)
-		return fmt.Errorf("failed to write CSTP config: %w", err)
-	}
-
-	log.Printf("OpenConnect: CSTP config sent successfully for user %s (IP: %s, MTU: %d)", user.Username, user.VPNIP, h.config.VPN.MTU)
-	return nil
+	return ""
 }
 
 func (h *Handler) ConnectMiddleware(c *gin.Context) {
-
 	if !c.GetBool("authenticated") {
 		log.Printf("OpenConnect: Unauthenticated connection attempt")
 		c.AbortWithStatus(http.StatusForbidden)
@@ -1181,11 +940,11 @@ func (h *Handler) handleDTLSPackets(conn *net.UDPConn) {
 			continue
 		}
 
-		h.dtlsLock.Lock()
+		// DTLS locking handled by manager
 		var matchedClient *TunnelClient
 		var matchedVPNIP string
 
-		for vpnIP, clientInfo := range h.dtlsClients {
+		for vpnIP, clientInfo := range h.dtlsManager.GetAllClients() {
 			if clientInfo.UDPAddr != nil && clientInfo.UDPAddr.IP.Equal(clientAddr.IP) && clientInfo.UDPAddr.Port == clientAddr.Port {
 				matchedClient = clientInfo.Client
 				matchedVPNIP = vpnIP
@@ -1199,7 +958,7 @@ func (h *Handler) handleDTLSPackets(conn *net.UDPConn) {
 			if packetType == PacketTypeData && len(payload) >= 20 {
 
 				srcIP := net.IP(payload[12:16])
-				for vpnIP, clientInfo := range h.dtlsClients {
+				for vpnIP, clientInfo := range h.dtlsManager.GetAllClients() {
 					if clientInfo.Client != nil && clientInfo.Client.IP != nil && srcIP.Equal(clientInfo.Client.IP) {
 						matchedClient = clientInfo.Client
 						matchedVPNIP = vpnIP
@@ -1213,9 +972,9 @@ func (h *Handler) handleDTLSPackets(conn *net.UDPConn) {
 			}
 
 			if matchedClient == nil && (packetType == PacketTypeKeepalive || packetType == PacketTypeDPD) {
-				if len(h.dtlsClients) == 1 {
+				if h.dtlsManager.GetClientCount() == 1 {
 
-					for vpnIP, clientInfo := range h.dtlsClients {
+					for vpnIP, clientInfo := range h.dtlsManager.GetAllClients() {
 						if clientInfo.Client != nil {
 							matchedClient = clientInfo.Client
 							matchedVPNIP = vpnIP
@@ -1230,10 +989,10 @@ func (h *Handler) handleDTLSPackets(conn *net.UDPConn) {
 		}
 
 		if matchedClient == nil {
-			h.dtlsLock.Unlock()
+			// DTLS unlocking handled by manager
 			log.Printf("DTLS: No matching client found for packet from %s (type: 0x%02x, size: %d bytes)", clientAddr, packetType, n)
-			log.Printf("DTLS: Available clients: %d", len(h.dtlsClients))
-			for vpnIP, clientInfo := range h.dtlsClients {
+			log.Printf("DTLS: Available clients: %d", h.dtlsManager.GetClientCount())
+			for vpnIP, clientInfo := range h.dtlsManager.GetAllClients() {
 				if clientInfo.Client != nil && clientInfo.Client.IP != nil {
 					log.Printf("DTLS:   - VPN IP: %s, Client IP: %s, UDP Addr: %v", vpnIP, clientInfo.Client.IP.String(), clientInfo.UDPAddr)
 				}
@@ -1241,12 +1000,11 @@ func (h *Handler) handleDTLSPackets(conn *net.UDPConn) {
 			continue
 		}
 
-		if h.dtlsClients[matchedVPNIP].UDPAddr == nil {
-			h.dtlsClients[matchedVPNIP].UDPAddr = clientAddr
-		}
+		// 使用 UpdateAddr 方法更新客户端地址
+		h.dtlsManager.UpdateAddr(matchedVPNIP, clientAddr)
 
 		clientToProcess := matchedClient
-		h.dtlsLock.Unlock()
+		// DTLS unlocking handled by manager
 
 		go func(packetType byte, payload []byte, client *TunnelClient) {
 			if err := client.processPacket(packetType, payload); err != nil {
@@ -1261,9 +1019,9 @@ func (h *Handler) SendDTLSPacket(vpnIP string, packetType byte, data []byte) err
 		return fmt.Errorf("DTLS not enabled")
 	}
 
-	h.dtlsLock.RLock()
-	clientInfo, exists := h.dtlsClients[vpnIP]
-	h.dtlsLock.RUnlock()
+	// DTLS RLock handled by manager
+	clientInfo, exists := h.dtlsManager.GetByVPNIP(vpnIP)
+	// DTLS RUnlock handled by manager
 
 	if !exists || clientInfo == nil || clientInfo.Client == nil {
 		return fmt.Errorf("DTLS client not found for VPN IP: %s", vpnIP)
@@ -1336,4 +1094,3 @@ func closeConnectionGracefully(conn net.Conn) {
 		}
 	}
 }
-

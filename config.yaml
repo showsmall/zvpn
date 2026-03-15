@@ -50,4 +50,3 @@ vpn:
 jwt:
   secret: "de3b81da80999e0ab400286b838799eb0e56e9ea804783d873b0a3960c2cf7c7"  # 生产环境必须修改！
   expiration: 24  # Token 过期时间（小时）
-

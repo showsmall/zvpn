@@ -15,11 +15,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fisker/zvpn/auth"
-	"github.com/fisker/zvpn/database"
-	"github.com/fisker/zvpn/handlers"
+	"github.com/fisker/zvpn/internal/auth"
+	"github.com/fisker/zvpn/internal/configutil"
+	"github.com/fisker/zvpn/internal/database"
+	"github.com/fisker/zvpn/internal/ippool"
 	"github.com/fisker/zvpn/models"
-	"github.com/fisker/zvpn/vpn"
 	"github.com/fisker/zvpn/vpn/policy"
 	"github.com/gin-gonic/gin"
 )
@@ -908,7 +908,7 @@ func (h *Handler) Authenticate(c *gin.Context) {
 
 	if user.VPNIP == "" {
 		_, ipNet, _ := net.ParseCIDR(h.config.VPN.Network)
-		ipPool, err := vpn.NewIPPool(ipNet)
+		ipPool, err := ippool.New(ipNet)
 		if err != nil {
 			h.sendAuthError(c, "IP allocation failed")
 			return
@@ -1002,7 +1002,7 @@ func (h *Handler) Authenticate(c *gin.Context) {
 		profileHash = "0000000000000000000000000000000000000000"
 	}
 
-	bannerText := handlers.GetBannerText()
+	bannerText := configutil.GetBannerText()
 
 	var bannerEscaped string
 	if bannerText != "" {
@@ -1067,4 +1067,3 @@ func (h *Handler) handleLogout(c *gin.Context) {
 
 	c.Data(http.StatusOK, "text/xml; charset=utf-8", []byte(xml))
 }
-

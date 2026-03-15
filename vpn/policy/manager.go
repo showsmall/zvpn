@@ -127,11 +127,8 @@ func (m *Manager) syncHookToEBPF(hook Hook) error {
 
 	// Add policy to eBPF
 	if err := m.ebpfLoader.AddPolicy(uint(policyID), hook, action); err != nil {
-		return fmt.Errorf("failed to sync hook %s to eBPF: %w", hook.Name(), err)
+		return fmt.Errorf("sync hook %s to eBPF: %w", hook.Name(), err)
 	}
-
-	log.Printf("eBPF: Synced hook %s to eBPF with policy ID %d (hook point: %s, action: %s, priority: %d)",
-		hook.Name(), policyID, hook.HookPoint().String(), action.String(), hook.Priority())
 	return nil
 }
 

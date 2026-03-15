@@ -7,7 +7,7 @@ import (
 	"log"
 	"strings"
 
-	"github.com/fisker/zvpn/database"
+	"github.com/fisker/zvpn/internal/database"
 	"github.com/fisker/zvpn/models"
 	"github.com/gin-gonic/gin"
 	"github.com/pquerna/otp/totp"

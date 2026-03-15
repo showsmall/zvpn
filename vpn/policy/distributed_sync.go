@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fisker/zvpn/database"
+	"github.com/fisker/zvpn/internal/database"
 	"github.com/fisker/zvpn/models"
 )
 
@@ -142,7 +142,7 @@ func (d *DistributedSyncManager) fullSync() {
 				}
 
 				// Register or re-register hook
-				hook := convertModelHookToPolicyHook(&hookModel)
+				hook := ConvertModelHookToPolicyHook(&hookModel)
 				if hook != nil {
 					if err := d.manager.RegisterHook(hook); err != nil {
 						log.Printf("Distributed sync: Failed to register hook %s: %v", hookID, err)
@@ -242,7 +242,7 @@ func (d *DistributedSyncManager) incrementalSync() {
 			}
 
 			// Register or re-register hook
-			hook := convertModelHookToPolicyHook(&hookModel)
+			hook := ConvertModelHookToPolicyHook(&hookModel)
 			if hook != nil {
 				if err := d.manager.RegisterHook(hook); err != nil {
 					log.Printf("Distributed sync: Failed to update hook %s: %v", hookID, err)
@@ -304,7 +304,7 @@ func (d *DistributedSyncManager) SyncHook(hookID string) error {
 
 	if hookModel.Enabled {
 		// Register hook
-		hook := convertModelHookToPolicyHook(&hookModel)
+		hook := ConvertModelHookToPolicyHook(&hookModel)
 		if hook != nil {
 			if err := d.manager.RegisterHook(hook); err != nil {
 				return fmt.Errorf("failed to register hook: %w", err)

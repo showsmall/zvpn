@@ -1,0 +1,831 @@
+package server
+
+import (
+	"encoding/binary"
+	"fmt"
+	"log"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/fisker/zvpn/config"
+	"github.com/fisker/zvpn/internal/compression"
+	"github.com/fisker/zvpn/internal/database"
+	"github.com/fisker/zvpn/internal/ippool"
+	"github.com/fisker/zvpn/internal/routing"
+	"github.com/fisker/zvpn/models"
+	"github.com/fisker/zvpn/vpn/ebpf"
+	"github.com/fisker/zvpn/vpn/policy"
+	"github.com/fisker/zvpn/vpn/security"
+	"github.com/fisker/zvpn/vpn/util"
+	"github.com/vishvananda/netlink"
+)
+
+type VPNServer struct {
+	config       *config.Config
+	routeMgr     *routing.Manager
+	policyMgr    *policy.Manager
+	ebpfProgram  *ebpf.XDPProgram // XDP program for ingress traffic (eth0) - policy checking only
+	tcProgram    ebpf.TCNATProgram
+	tcProgramTUN ebpf.TCNATProgram
+	forwarder    *PacketForwarder
+	ipPool       *ippool.IPPool
+	tunDevice    *TUNDevice // 共享的TUN设备实例
+	xdpSocket    *ebpf.XDPSocket // AF_XDP socket for zero-copy (experimental)
+
+	// Lock optimization: use sharded maps if enabled, otherwise use regular maps with locks
+	useShardedLocks bool
+	clients         map[uint]*VPNClient // Used when sharded locks disabled
+	clientsLock     sync.RWMutex        // Used when sharded locks disabled
+	shardedClients  *ShardedClientMap   // Used when sharded locks enabled
+	vpnIPToUser     map[string]uint     // Used when sharded locks disabled
+	vpnIPLock       sync.RWMutex        // Used when sharded locks disabled
+	shardedVPNIP    *ShardedVPNIPMap    // Used when sharded locks enabled
+
+	// Compression manager
+	CompressionMgr *compression.CompressionManager
+
+	// Memory pool for packet buffers
+	packetPool *sync.Pool
+
+	// Bruteforce protection
+	bruteforceProtection interface{} // *security.BruteforceProtection (avoid circular import)
+
+	// Egress IP for NAT masquerading (stored for user-space NAT)
+	egressIP     net.IP
+	egressIPLock sync.RWMutex
+}
+
+type VPNClient struct {
+	UserID     uint
+	User       *models.User
+	Conn       net.Conn
+	DTLSConn   net.Conn // DTLS connection (if DTLS is enabled and established)
+	IP         net.IP
+	UserAgent  string
+	ClientOS   string
+	ClientVer  string
+	Connected  bool
+	lock       sync.Mutex
+	writeLock  sync.Mutex    // Separate lock for writes to avoid blocking reads
+	WriteChan  chan []byte   // Channel for queuing packets to send
+	WriteClose chan struct{} // Channel to signal write goroutine to stop
+	server     *VPNServer    // Reference to server for config access (optional)
+}
+
+// NewVPNServer creates a new VPN server
+func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
+	// 初始化路由管理器
+	routeMgr := routing.New(cfg.VPN.InterfaceName)
+
+	// 尝试创建和配置TUN设备
+	log.Printf("Attempting to create and configure TUN device: %s", cfg.VPN.InterfaceName)
+	var tunDevice *TUNDevice
+	// 解析VPN网络并创建TUN设备
+	_, ipNet, err := net.ParseCIDR(cfg.VPN.Network)
+	if err != nil {
+		return nil, fmt.Errorf("invalid VPN network: %w", err)
+	}
+
+	// 计算网关IP和TUN地址
+	gatewayIP := make(net.IP, len(ipNet.IP))
+	copy(gatewayIP, ipNet.IP)
+	gatewayIP[len(gatewayIP)-1] = 1
+	ones, _ := ipNet.Mask.Size()
+	tunAddress := fmt.Sprintf("%s/%d", gatewayIP.String(), ones)
+	log.Printf("TUN device will be configured with IP address: %s (gateway IP: %s)", tunAddress, gatewayIP.String())
+
+			tunDevice, err = NewTUNDevice(cfg.VPN.InterfaceName, tunAddress, cfg.VPN.MTU)
+	if err != nil {
+		log.Printf("Warning: Failed to create TUN device: %v", err)
+		log.Printf("Using existing virtual network interface if available: %s", cfg.VPN.InterfaceName)
+	} else {
+		log.Printf("TUN device created successfully")
+	}
+
+	// 检查接口是否存在
+	_, err = netlink.LinkByName(cfg.VPN.InterfaceName)
+	if err != nil {
+		log.Printf("Warning: Virtual network interface %s not found. VPN functionality may be limited.", cfg.VPN.InterfaceName)
+	} else {
+		log.Printf("Virtual network interface %s is available", cfg.VPN.InterfaceName)
+		// 如果接口存在但创建失败，尝试获取现有接口
+		if tunDevice == nil {
+			tunDevice, err = NewTUNDevice(cfg.VPN.InterfaceName, tunAddress, cfg.VPN.MTU)
+			if err != nil {
+				log.Printf("Warning: Failed to open existing TUN device: %v", err)
+			} else {
+				log.Printf("Opened existing TUN device successfully")
+			}
+		}
+	}
+
+	// 创建IP池
+	ipPool, err := ippool.New(ipNet)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create IP pool: %w", err)
+	}
+	// Reserve gateway IP to avoid assigning to clients
+	ipPool.Reserve(gatewayIP)
+
+	// Initialize policy manager
+	policyMgr := policy.NewManager()
+
+	// 注册默认路由策略
+	if err = registerDefaultPolicies(policyMgr, cfg); err != nil {
+		log.Printf("Warning: Failed to register default policies: %v", err)
+	}
+
+	// Initialize eBPF XDP (required)
+	var ebpfProg *ebpf.XDPProgram
+
+	// Load eBPF program on the main network interface (required)
+	log.Printf("Loading eBPF XDP program on interface: %s", cfg.VPN.EBPFInterfaceName)
+	ebpfProg, err = ebpf.LoadXDPProgram(cfg.VPN.EBPFInterfaceName)
+	if err != nil {
+		log.Fatalf("Failed to load eBPF XDP program on %s: %v (eBPF is required)", cfg.VPN.EBPFInterfaceName, err)
+	}
+	log.Printf("eBPF XDP program loaded successfully on %s", cfg.VPN.EBPFInterfaceName)
+
+	// 初始化 eBPF rate limit 和 DDoS 防护配置
+	if err := initializeEBPFRateLimitConfig(ebpfProg, cfg); err != nil {
+		log.Printf("Warning: Failed to initialize eBPF rate limit config: %v", err)
+	} else {
+		log.Printf("eBPF rate limit and DDoS protection config initialized")
+	}
+
+	// 设置策略管理器的eBPF加载器（eBPF已加载）
+	ebpfLoader := policy.NewEBPFLoader(ebpfProg)
+	policyMgr.SetEBPFLoader(ebpfLoader)
+	log.Printf("Policy manager integrated with eBPF")
+
+	// Initialize public IP for NAT masquerading
+	publicIP, err := routing.GetEgressInterfaceIP()
+	if err != nil {
+		log.Printf("Warning: Failed to auto-detect egress interface IP: %v", err)
+		log.Printf("Attempting to use interface IP from other methods...")
+
+		ifaces, err := net.Interfaces()
+		if err == nil {
+			for _, iface := range ifaces {
+				if iface.Flags&net.FlagLoopback != 0 {
+					continue
+				}
+				addrs, err := iface.Addrs()
+				if err != nil {
+					continue
+				}
+				for _, addr := range addrs {
+					ipNet, ok := addr.(*net.IPNet)
+					if ok && ipNet.IP.To4() != nil && !ipNet.IP.IsLoopback() && !ipNet.IP.IsLinkLocalUnicast() {
+						publicIP = ipNet.IP
+						log.Printf("Using IP from interface %s: %s", iface.Name, publicIP.String())
+						break
+					}
+				}
+				if publicIP != nil {
+					break
+				}
+			}
+		}
+	}
+
+	var egressIPForServer net.IP
+	var tcProg ebpf.TCNATProgram
+	var tcProgTUN ebpf.TCNATProgram
+
+	if publicIP != nil {
+		if err := ebpfProg.SetPublicIP(publicIP); err != nil {
+			log.Printf("Warning: Failed to set egress IP in eBPF XDP map: %v", err)
+		} else {
+			log.Printf("✅ eBPF XDP: Public IP configured: %s (for policy checking)", publicIP.String())
+		}
+
+		log.Printf("配置 NAT: 使用 eBPF TC egress NAT (接口: %s, NAT IP: %s)", cfg.VPN.EBPFInterfaceName, publicIP.String())
+		tcProg, err = ebpf.LoadTCNATProgram(cfg.VPN.EBPFInterfaceName, publicIP, cfg.VPN.Network)
+		if err != nil {
+			log.Printf("接口: %s, eBPF TC NAT 加载失败: %v", cfg.VPN.EBPFInterfaceName, err)
+		} else {
+			log.Printf("eBPF TC NAT 加载成功, 接口: %s, NAT IP: %s, VPN 网络: %s", cfg.VPN.EBPFInterfaceName, publicIP.String(), cfg.VPN.Network)
+		}
+
+		if tunDevice != nil {
+			tunDeviceName := tunDevice.Name()
+			log.Printf("配置 NAT: 尝试在 TUN 设备上使用 eBPF TC egress NAT (接口: %s, NAT IP: %s)", tunDeviceName, publicIP.String())
+			var errTUN error
+			tcProgTUN, errTUN = ebpf.LoadTCNATProgram(tunDeviceName, publicIP, cfg.VPN.Network)
+			if errTUN != nil {
+				log.Printf("TUN 设备 %s, eBPF TC NAT 加载失败: %v (TUN设备可能不支持TC egress hook，继续使用 eth0 NAT)", tunDeviceName, errTUN)
+				tcProgTUN = nil
+			} else {
+				log.Printf("✅ eBPF TC NAT 在 TUN 设备 %s 加载成功, NAT IP: %s, VPN 网络: %s", tunDeviceName, publicIP.String(), cfg.VPN.Network)
+			}
+		} else {
+			tcProgTUN = nil
+		}
+
+		egressIPForServer = publicIP
+	} else {
+		log.Printf("Warning: Failed to detect egress interface IP from default route.")
+		log.Printf("配置 NAT: 尝试使用 eBPF TC egress NAT，将从接口 %s 获取 IP...", cfg.VPN.EBPFInterfaceName)
+		tcProg, err = ebpf.LoadTCNATProgram(cfg.VPN.EBPFInterfaceName, nil, cfg.VPN.Network)
+		if err != nil {
+			log.Printf("❌ eBPF TC NAT 加载失败: %v, 请确保接口 %s 有有效的 IPv4 地址", err, cfg.VPN.EBPFInterfaceName)
+		} else {
+			log.Printf("✅ eBPF TC NAT 加载成功: 使用 eBPF TC egress NAT")
+		}
+		tcProgTUN = nil
+	}
+
+	// Initialize packet forwarder
+	packetForwarder, err := NewPacketForwarder()
+	if err != nil {
+		log.Printf("Warning: Failed to initialize packet forwarder: %v", err)
+	}
+
+	// Enable IP forwarding
+	if err := EnableIPForwarding(); err != nil {
+		log.Printf("Warning: Failed to enable IP forwarding: %v", err)
+	}
+
+	log.Printf("TUN device IP configured: %s - kernel will automatically recognize this as local IP", tunAddress)
+
+	// Initialize lock optimization based on config
+	useShardedLocks := cfg.VPN.EnableShardedLocks
+	shardCount := cfg.VPN.ShardCount
+	if shardCount <= 0 {
+		shardCount = 16
+	}
+
+	server := &VPNServer{
+		config:          cfg,
+		routeMgr:        routeMgr,
+		policyMgr:       policyMgr,
+		ebpfProgram:     ebpfProg,
+		tcProgram:       tcProg,
+		tcProgramTUN:    tcProgTUN,
+		forwarder:       packetForwarder,
+		ipPool:          ipPool,
+		tunDevice:       tunDevice,
+		xdpSocket:       nil,
+		useShardedLocks: useShardedLocks,
+		egressIP:        egressIPForServer,
+	}
+
+	if useShardedLocks {
+		server.shardedClients = NewShardedClientMap(shardCount)
+		server.shardedVPNIP = NewShardedVPNIPMap(shardCount)
+		log.Printf("Sharded locks enabled with %d shards for better concurrency", shardCount)
+	} else {
+		server.clients = make(map[uint]*VPNClient)
+		server.vpnIPToUser = make(map[string]uint)
+		log.Printf("Using standard locks (sharded locks disabled)")
+	}
+
+	// Initialize compression manager
+	compressionType := compression.CompressionType(cfg.VPN.CompressionType)
+	if compressionType == "" {
+		compressionType = compression.CompressionNone
+	}
+	if cfg.VPN.EnableCompression && compressionType != compression.CompressionNone {
+		server.CompressionMgr = compression.NewCompressionManager(compressionType)
+		log.Printf("Traffic compression enabled: %s", compressionType)
+	} else {
+		server.CompressionMgr = compression.NewCompressionManager(compression.CompressionNone)
+	}
+
+	// Initialize packet buffer pool
+	server.packetPool = &sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 1600)
+		},
+	}
+
+	// Initialize bruteforce protection if enabled
+	if cfg.VPN.EnableBruteforceProtection {
+		maxAttempts := cfg.VPN.MaxLoginAttempts
+		if maxAttempts <= 0 {
+			maxAttempts = 5
+		}
+		lockoutDuration := time.Duration(cfg.VPN.LoginLockoutDuration) * time.Second
+		if lockoutDuration <= 0 {
+			lockoutDuration = 15 * time.Minute
+		}
+		windowDuration := time.Duration(cfg.VPN.LoginAttemptWindow) * time.Second
+		if windowDuration <= 0 {
+			windowDuration = 5 * time.Minute
+		}
+
+		bruteforceProtection := security.NewBruteforceProtection(maxAttempts, lockoutDuration, windowDuration)
+		server.bruteforceProtection = bruteforceProtection
+
+		if ebpfProg != nil {
+			bruteforceProtection.SetEBPFProgram(ebpfProg)
+			log.Printf("Bruteforce protection initialized with eBPF kernel-level blocking support")
+		} else {
+			log.Printf("Bruteforce protection initialized (eBPF not available, using user-space only)")
+		}
+	}
+
+	// Try to initialize AF_XDP socket for zero-copy (experimental)
+	if cfg.VPN.EnableAFXDP {
+		log.Printf("Attempting to initialize AF_XDP zero-copy optimization...")
+		if cfg.VPN.EBPFInterfaceName != "" {
+			xdpSock, err := ebpf.NewXDPSocket(cfg.VPN.EBPFInterfaceName, cfg.VPN.AFXDPQueueID)
+			if err != nil {
+				log.Printf("Warning: Failed to create AF_XDP socket: %v", err)
+				log.Printf("Falling back to TUN device")
+			} else {
+				if err := xdpSock.Enable(); err != nil {
+					log.Printf("Warning: Failed to enable AF_XDP socket: %v", err)
+					xdpSock.Close()
+					log.Printf("Falling back to TUN device")
+				} else {
+					server.xdpSocket = xdpSock
+					log.Printf("✅ AF_XDP socket created and enabled for interface %s (queue %d)",
+						cfg.VPN.EBPFInterfaceName, cfg.VPN.AFXDPQueueID)
+					log.Printf("Note: AF_XDP provides zero-copy packet processing")
+					log.Printf("Note: Ensure eBPF XDP program redirects packets to AF_XDP socket")
+				}
+			}
+		} else {
+			log.Printf("Warning: AF_XDP enabled but EBPFInterfaceName not set, falling back to TUN")
+		}
+	}
+
+	// Start packet listener
+	if cfg.VPN.LogSampleRate > 0 {
+		util.SetLogSampleRate(cfg.VPN.LogSampleRate)
+		log.Printf("Log sampling enabled: logging every %d packets", cfg.VPN.LogSampleRate)
+	}
+
+	ebpf.StartAuditLoggerIfEnabled(ebpfProg)
+
+	// If AF_XDP is enabled and working, use it; otherwise fallback to TUN
+	if server.xdpSocket != nil && server.xdpSocket.IsEnabled() {
+		if listenAFXDPFunc := getAFXDPListener(); listenAFXDPFunc != nil {
+			log.Printf("Starting AF_XDP packet listener (zero-copy mode)")
+			go listenAFXDPFunc(server, server.xdpSocket)
+		} else {
+			log.Printf("Warning: AF_XDP enabled but listener not available on this platform, falling back to TUN")
+		}
+	}
+
+	if tunDevice != nil && (server.xdpSocket == nil || !server.xdpSocket.IsEnabled()) {
+		if cfg.VPN.EnableBatchProcessing {
+			if batchFunc := getBatchListener(); batchFunc != nil {
+				go batchFunc(server, tunDevice)
+				log.Println("Global TUN device batch listener started (optimized)")
+			} else {
+				log.Println("Batch processing not available on this platform, using regular listener")
+				go server.listenTUNDevice(tunDevice)
+				log.Println("Global TUN device listener started")
+			}
+		} else {
+			go server.listenTUNDevice(tunDevice)
+			log.Println("Global TUN device listener started")
+		}
+	}
+
+	// Start packet receiver if forwarder is enabled
+	if packetForwarder != nil && packetForwarder.IsEnabled() {
+		getVPNIPUser := func(ip string) (uint, bool) {
+			return server.getVPNIPUser(ip)
+		}
+		packetForwarder.StartPacketReceiver(ipNet, getVPNIPUser, func(userID uint, packet []byte) {
+			client, exists := server.getClient(userID)
+
+			if exists && client.Connected {
+				if err := packetForwarder.ForwardToClient(userID, packet, client.Conn); err != nil {
+					log.Printf("Failed to forward packet to client %d: %v", userID, err)
+				}
+			}
+		})
+	}
+
+	return server, nil
+}
+
+// GetBruteforceProtection returns the bruteforce protection instance
+func (s *VPNServer) GetBruteforceProtection() interface{} {
+	return s.bruteforceProtection
+}
+
+// GetEBPFProgram returns the eBPF XDP program
+func (s *VPNServer) GetEBPFProgram() *ebpf.XDPProgram {
+	return s.ebpfProgram
+}
+
+// GetTCNATStats returns current TC NAT counters when the TC program is loaded.
+func (s *VPNServer) GetTCNATStats() (map[uint32]uint64, error) {
+	if s.tcProgram == nil {
+		return nil, fmt.Errorf("TC program not loaded")
+	}
+	return s.tcProgram.GetNATStats()
+}
+
+// GetConfig returns the VPN server configuration
+func (s *VPNServer) GetConfig() *config.Config {
+	return s.config
+}
+
+// GetPacketBuffer retrieves a buffer from the packet pool
+func (s *VPNServer) GetPacketBuffer() []byte {
+	return s.packetPool.Get().([]byte)
+}
+
+// PutPacketBuffer returns a buffer to the packet pool
+func (s *VPNServer) PutPacketBuffer(buf []byte) {
+	for i := range buf {
+		buf[i] = 0
+	}
+	s.packetPool.Put(buf)
+}
+
+// BuildCSTPPacket builds a CSTP packet using the packet pool
+func (s *VPNServer) BuildCSTPPacket(payload []byte) ([]byte, error) {
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("payload cannot be empty")
+	}
+
+	packetSize := 3 + 5 + len(payload)
+	buf := s.GetPacketBuffer()
+
+	if len(buf) < packetSize {
+		s.PutPacketBuffer(buf)
+		buf = make([]byte, packetSize)
+	}
+
+	packet := buf[:packetSize]
+	packet[0] = 'S'
+	packet[1] = 'T'
+	packet[2] = 'F'
+	packet[3] = 0x01
+	payloadLen := uint16(len(payload))
+	binary.BigEndian.PutUint16(packet[4:6], payloadLen)
+	packet[6] = 0x00
+	packet[7] = 0x00
+	copy(packet[8:], payload)
+
+	return packet, nil
+}
+
+// GetPolicyManager returns the policy manager
+func (s *VPNServer) GetPolicyManager() *policy.Manager {
+	return s.policyMgr
+}
+
+// GetRouteManager 已废弃
+func (s *VPNServer) GetRouteManager() *routing.Manager {
+	return s.routeMgr
+}
+
+// GetForwarder returns the packet forwarder
+func (s *VPNServer) GetForwarder() *PacketForwarder {
+	return s.forwarder
+}
+
+// GetTUNDevice returns the shared TUN device instance
+func (s *VPNServer) GetTUNDevice() *TUNDevice {
+	return s.tunDevice
+}
+
+// GetVPNGatewayIP returns the VPN gateway IP address
+func (s *VPNServer) GetVPNGatewayIP() net.IP {
+	if s.tunDevice != nil {
+		if tunIP, err := s.tunDevice.GetIP(); err == nil {
+			return tunIP
+		}
+	}
+
+	if s.config != nil {
+		_, vpnNet, err := net.ParseCIDR(s.config.VPN.Network)
+		if err == nil {
+			gatewayIP := make(net.IP, len(vpnNet.IP))
+			copy(gatewayIP, vpnNet.IP)
+			gatewayIP[len(gatewayIP)-1] = 1
+			return gatewayIP
+		}
+	}
+
+	return nil
+}
+
+// GetIPPool returns the IP pool
+func (s *VPNServer) GetIPPool() *ippool.IPPool {
+	return s.ipPool
+}
+
+// registerDefaultPolicies registers default routing policies
+func registerDefaultPolicies(policyMgr *policy.Manager, cfg *config.Config) error {
+	vpnNetworkHook := policy.NewACLHook(
+		"vpn_network_allow",
+		policy.HookPreRouting,
+		10,
+		policy.ActionAllow,
+	)
+
+	if _, ipNet, err := net.ParseCIDR(cfg.VPN.Network); err == nil {
+		vpnNetworkHook.AddDestinationNetwork(ipNet)
+		vpnNetworkHook.AddSourceNetwork(ipNet)
+	}
+
+	if err := policyMgr.RegisterHook(vpnNetworkHook); err != nil {
+		return fmt.Errorf("failed to register VPN network hook: %w", err)
+	}
+
+	log.Printf("Registered default VPN network policy")
+	return nil
+}
+
+// CreatePolicyHooks creates policy hooks for a user
+func (s *VPNServer) CreatePolicyHooks(user *models.User) error {
+	if s.policyMgr == nil {
+		return nil
+	}
+	return policy.CreatePolicyHooks(s.policyMgr, user)
+}
+
+// RemovePolicyHooks removes policy hooks for a user
+func (s *VPNServer) RemovePolicyHooks(userID uint) error {
+	if s.policyMgr == nil {
+		return nil
+	}
+	return policy.RemovePolicyHooks(s.policyMgr, userID)
+}
+
+// initializeEBPFRateLimitConfig initializes eBPF rate limit and DDoS protection configuration
+func initializeEBPFRateLimitConfig(ebpfProg *ebpf.XDPProgram, cfg *config.Config) error {
+	if ebpfProg == nil {
+		return fmt.Errorf("eBPF program not loaded")
+	}
+
+	rateLimitConfig := ebpf.RateLimitConfig{
+		EnableRateLimit:      boolToUint8(cfg.VPN.EnableRateLimit),
+		RateLimitPerIP:       uint64(cfg.VPN.RateLimitPerIP),
+		EnableDDoSProtection: boolToUint8(cfg.VPN.EnableDDoSProtection),
+		DDoSThreshold:        uint64(cfg.VPN.DDoSThreshold),
+		DDoSBlockDuration:    uint64(cfg.VPN.DDoSBlockDuration) * 1000000000,
+	}
+
+	if err := ebpfProg.UpdateRateLimitConfig(rateLimitConfig); err != nil {
+		return fmt.Errorf("failed to update eBPF rate limit config: %w", err)
+	}
+
+	return nil
+}
+
+func boolToUint8(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// RegisterClient registers a VPN client
+func (s *VPNServer) RegisterClient(userID uint, client *VPNClient) {
+	if cap(client.WriteChan) == 0 {
+		bufferSize := s.config.VPN.WriteChanBufferSize
+		if bufferSize <= 0 {
+			bufferSize = 100
+		}
+		client.WriteChan = make(chan []byte, bufferSize)
+	}
+
+	client.server = s
+
+	s.setClient(userID, client)
+	vpnIPStr := client.IP.String()
+	s.setVPNIPUser(vpnIPStr, userID)
+	log.Printf("Registered VPN client: userID=%d, IP=%s (stored as '%s')", userID, client.IP.String(), vpnIPStr)
+
+	if s.forwarder != nil {
+		clientAddr := &net.IPAddr{IP: client.IP}
+		s.forwarder.RegisterClient(userID, client.IP, clientAddr)
+	}
+
+	var clientRealIP net.IP
+	if client.Conn != nil {
+		if remoteAddr := client.Conn.RemoteAddr(); remoteAddr != nil {
+			host, _, err := net.SplitHostPort(remoteAddr.String())
+			if err == nil {
+				clientRealIP = net.ParseIP(host)
+			}
+		}
+	}
+
+	if clientRealIP == nil {
+		clientRealIP = client.IP
+	}
+
+	if s.ebpfProgram != nil {
+		if err := s.ebpfProgram.AddVPNClient(client.IP, clientRealIP); err != nil {
+			log.Printf("Warning: Failed to register VPN client in eBPF XDP map: %v", err)
+		} else {
+			log.Printf("✅ Registered VPN client in eBPF XDP map: VPN IP=%s, Real IP=%s", client.IP.String(), clientRealIP.String())
+		}
+	}
+
+	if s.tcProgram != nil {
+		if err := s.tcProgram.AddVPNClient(client.IP, clientRealIP); err != nil {
+			log.Printf("Warning: Failed to register VPN client in eBPF TC map: %v", err)
+		} else {
+			log.Printf("✅ Registered VPN client in eBPF TC map: VPN IP=%s, Real IP=%s", client.IP.String(), clientRealIP.String())
+		}
+	}
+}
+
+// GetClient exposes client info for administrative queries
+func (s *VPNServer) GetClient(userID uint) (*VPNClient, bool) {
+	return s.getClient(userID)
+}
+
+// UnregisterClient unregisters a VPN client
+func (s *VPNServer) UnregisterClient(userID uint, vpnIP string) {
+	client, exists := s.getClient(userID)
+	if exists {
+		select {
+		case <-client.WriteClose:
+		default:
+			close(client.WriteClose)
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Warning: WriteChan already closed for client %d", userID)
+				}
+			}()
+			close(client.WriteChan)
+		}()
+
+		if client.IP != nil {
+			if s.ebpfProgram != nil {
+				if err := s.ebpfProgram.RemoveVPNClient(client.IP); err != nil {
+					log.Printf("Warning: Failed to remove VPN client from eBPF XDP map: %v", err)
+				} else {
+					log.Printf("Removed VPN client from eBPF XDP map: VPN IP=%s", client.IP.String())
+				}
+			}
+
+			if s.tcProgram != nil {
+				if err := s.tcProgram.RemoveVPNClient(client.IP); err != nil {
+					log.Printf("Warning: Failed to remove VPN client from eBPF TC map: %v", err)
+				} else {
+					log.Printf("Removed VPN client from eBPF TC map: VPN IP=%s", client.IP.String())
+				}
+			}
+		}
+	}
+	s.deleteClient(userID)
+	s.deleteVPNIPUser(vpnIP)
+
+	if s.forwarder != nil {
+		s.forwarder.UnregisterClient(userID)
+	}
+}
+
+func (s *VPNServer) Stop() error {
+	if s.policyMgr != nil {
+		s.policyMgr.StopHookSync()
+	}
+	clients := s.getAllClients()
+	for _, client := range clients {
+		client.Conn.Close()
+		client.User.Connected = false
+		database.DB.Save(client.User)
+	}
+
+	if s.ebpfProgram != nil {
+		if err := s.ebpfProgram.Close(); err != nil {
+			log.Printf("Error closing eBPF XDP program: %v", err)
+		}
+	}
+
+	if s.tcProgram != nil {
+		if err := s.tcProgram.Close(); err != nil {
+			log.Printf("Error closing eBPF TC program: %v", err)
+		}
+	}
+	if s.tcProgramTUN != nil {
+		if err := s.tcProgramTUN.Close(); err != nil {
+			log.Printf("Error closing eBPF TC TUN program: %v", err)
+		}
+	}
+
+	if s.forwarder != nil {
+		if err := s.forwarder.Close(); err != nil {
+			log.Printf("Error closing packet forwarder: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// getClient retrieves a client by user ID
+func (s *VPNServer) getClient(userID uint) (*VPNClient, bool) {
+	if s.useShardedLocks {
+		return s.shardedClients.Get(userID)
+	}
+	s.clientsLock.RLock()
+	defer s.clientsLock.RUnlock()
+	client, exists := s.clients[userID]
+	return client, exists
+}
+
+func (s *VPNServer) setClient(userID uint, client *VPNClient) {
+	if s.useShardedLocks {
+		s.shardedClients.Set(userID, client)
+		return
+	}
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
+	s.clients[userID] = client
+}
+
+func (s *VPNServer) deleteClient(userID uint) {
+	if s.useShardedLocks {
+		s.shardedClients.Delete(userID)
+		return
+	}
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
+	delete(s.clients, userID)
+}
+
+func (s *VPNServer) getVPNIPUser(ip string) (uint, bool) {
+	if s.useShardedLocks {
+		return s.shardedVPNIP.Get(ip)
+	}
+	s.vpnIPLock.RLock()
+	defer s.vpnIPLock.RUnlock()
+	userID, exists := s.vpnIPToUser[ip]
+	return userID, exists
+}
+
+func (s *VPNServer) setVPNIPUser(ip string, userID uint) {
+	if s.useShardedLocks {
+		s.shardedVPNIP.Set(ip, userID)
+		return
+	}
+	s.vpnIPLock.Lock()
+	defer s.vpnIPLock.Unlock()
+	s.vpnIPToUser[ip] = userID
+}
+
+func (s *VPNServer) deleteVPNIPUser(ip string) {
+	if s.useShardedLocks {
+		s.shardedVPNIP.Delete(ip)
+		return
+	}
+	s.vpnIPLock.Lock()
+	defer s.vpnIPLock.Unlock()
+	delete(s.vpnIPToUser, ip)
+}
+
+// GetVPNIPUser returns user ID by VPN IP (public wrapper).
+func (s *VPNServer) GetVPNIPUser(ip string) (uint, bool) {
+	return s.getVPNIPUser(ip)
+}
+
+// AllocateVPNIP allocates an IP from the shared pool.
+func (s *VPNServer) AllocateVPNIP() (net.IP, error) {
+	if s.ipPool == nil {
+		return nil, fmt.Errorf("ip pool not initialized")
+	}
+	return s.ipPool.Allocate()
+}
+
+// ReleaseVPNIP releases an IP back to the shared pool.
+func (s *VPNServer) ReleaseVPNIP(ip net.IP) {
+	if s.ipPool == nil || ip == nil {
+		return
+	}
+	s.ipPool.Release(ip)
+}
+
+// ReserveVPNIP marks an IP as used in the shared pool
+func (s *VPNServer) ReserveVPNIP(ip net.IP) {
+	if s.ipPool == nil || ip == nil {
+		return
+	}
+	s.ipPool.Reserve(ip)
+}
+
+func (s *VPNServer) getAllClients() []*VPNClient {
+	var clients []*VPNClient
+
+	if s.useShardedLocks {
+		s.shardedClients.Range(func(userID uint, client *VPNClient) bool {
+			clients = append(clients, client)
+			return true
+		})
+	} else {
+		s.clientsLock.RLock()
+		for _, client := range s.clients {
+			clients = append(clients, client)
+		}
+		s.clientsLock.RUnlock()
+	}
+
+	return clients
+}

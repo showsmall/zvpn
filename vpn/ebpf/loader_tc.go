@@ -1,5 +1,5 @@
-//go:build ebpf
-// +build ebpf
+//go:build linux && ebpf
+// +build linux,ebpf
 
 package ebpf
 
@@ -16,7 +16,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TCProgram represents an eBPF TC (Traffic Control) program for egress NAT
+// TCProgram holds loaded TC egress NAT objects and map references.
+// C为主、Go只负责装载和map操作.
 type TCProgram struct {
 	objs              *tc_natObjects
 	link              link.Link
@@ -70,7 +71,7 @@ func LoadTCProgram(ifName string) (*TCProgram, error) {
 			objs.Close()
 			return nil, fmt.Errorf("failed to attach TC program: %w (tried TCX and traditional TC clsact)", err)
 		}
-		log.Printf("✅ TC egress NAT program attached using traditional TC clsact qdisc (compatible with kernel 4.1+)")
+		log.Printf("TC egress NAT attached (clsact) on %s", ifName)
 		return &TCProgram{
 			objs:              objs,
 			link:              nil, // No link.Link for traditional TC
@@ -83,8 +84,7 @@ func LoadTCProgram(ifName string) (*TCProgram, error) {
 		}, nil
 	}
 
-	log.Printf("✅ TC egress NAT program attached using TCX (kernel 6.6+)")
-	log.Printf("✅ TC egress NAT program attached to interface %s", ifName)
+	log.Printf("TC egress NAT attached (TCX) on %s", ifName)
 
 	return &TCProgram{
 		objs:              objs,
@@ -98,66 +98,36 @@ func LoadTCProgram(ifName string) (*TCProgram, error) {
 	}, nil
 }
 
-// SetPublicIP sets the public IP address for NAT masquerading in TC eBPF
+// SetPublicIP sets the public IP for NAT masquerading
 func (t *TCProgram) SetPublicIP(publicIP net.IP) error {
 	if t == nil || t.serverEgressIPMap == nil {
-		return fmt.Errorf("TC program not loaded or server_egress_ip map not found")
+		return fmt.Errorf("TC program not loaded")
 	}
-
-	if publicIP == nil || publicIP.To4() == nil {
+	ipUint32 := IPToUint32(publicIP)
+	if ipUint32 == 0 {
 		return fmt.Errorf("invalid IPv4 address")
 	}
-
-	// Convert IP to network byte order (uint32)
-	ipBytes := publicIP.To4()
-	ipUint32 := uint32(ipBytes[0])<<24 | uint32(ipBytes[1])<<16 | uint32(ipBytes[2])<<8 | uint32(ipBytes[3])
-
-	// Store in map with key 0
-	key := uint32(0)
-	if err := t.serverEgressIPMap.Put(key, ipUint32); err != nil {
-		return fmt.Errorf("failed to set egress IP in TC eBPF map: %w", err)
+	if err := t.serverEgressIPMap.Put(uint32(0), ipUint32); err != nil {
+		return fmt.Errorf("set egress IP: %w", err)
 	}
-
-	log.Printf("✅ TC eBPF NAT: Server egress IP set to %s", publicIP.String())
 	return nil
 }
 
-// SetVPNNetwork sets the VPN network configuration in TC eBPF map
+// SetVPNNetwork sets the VPN network configuration
 func (t *TCProgram) SetVPNNetwork(vpnNetwork string) error {
 	if t == nil || t.vpnNetworkConfig == nil {
-		return fmt.Errorf("TC program not loaded or vpn_network_config map not found")
+		return fmt.Errorf("TC program not loaded")
 	}
-
-	// Parse VPN network CIDR
-	_, ipNet, err := net.ParseCIDR(vpnNetwork)
+	network, mask, err := ParseCIDRToUint32(vpnNetwork)
 	if err != nil {
-		return fmt.Errorf("invalid VPN network CIDR: %w", err)
+		return fmt.Errorf("invalid VPN CIDR: %w", err)
 	}
-
-	// Convert network address to network byte order (uint32)
-	ipBytes := ipNet.IP.To4()
-	if ipBytes == nil {
-		return fmt.Errorf("VPN network must be IPv4")
+	if err := t.vpnNetworkConfig.Put(uint32(0), network); err != nil {
+		return fmt.Errorf("set VPN network: %w", err)
 	}
-	networkUint32 := uint32(ipBytes[0])<<24 | uint32(ipBytes[1])<<16 | uint32(ipBytes[2])<<8 | uint32(ipBytes[3])
-
-	// Convert mask to uint32
-	maskBytes := ipNet.Mask
-	maskUint32 := uint32(maskBytes[0])<<24 | uint32(maskBytes[1])<<16 | uint32(maskBytes[2])<<8 | uint32(maskBytes[3])
-
-	// Store network address (key 0)
-	key := uint32(0)
-	if err := t.vpnNetworkConfig.Put(key, networkUint32); err != nil {
-		return fmt.Errorf("failed to set VPN network address in TC eBPF map: %w", err)
+	if err := t.vpnNetworkConfig.Put(uint32(1), mask); err != nil {
+		return fmt.Errorf("set VPN mask: %w", err)
 	}
-
-	// Store network mask (key 1)
-	key = 1
-	if err := t.vpnNetworkConfig.Put(key, maskUint32); err != nil {
-		return fmt.Errorf("failed to set VPN network mask in TC eBPF map: %w", err)
-	}
-
-	log.Printf("✅ TC eBPF NAT: VPN network configured: %s (network: 0x%08X, mask: 0x%08X)", vpnNetwork, networkUint32, maskUint32)
 	return nil
 }
 
@@ -167,11 +137,11 @@ func (t *TCProgram) AddVPNClient(vpnIP, clientIP net.IP) error {
 		return fmt.Errorf("TC program not loaded")
 	}
 
-	vpnIPUint32 := ipToUint32(vpnIP)
-	clientIPUint32 := ipToUint32(clientIP)
+	vpnIPUint32 := IPToUint32(vpnIP)
+	clientIPUint32 := IPToUint32(clientIP)
 
 	if err := t.vpnClients.Put(vpnIPUint32, clientIPUint32); err != nil {
-		return fmt.Errorf("failed to add VPN client mapping to TC eBPF map: %w", err)
+		return fmt.Errorf("add VPN client: %w", err)
 	}
 
 	return nil
@@ -183,9 +153,9 @@ func (t *TCProgram) RemoveVPNClient(vpnIP net.IP) error {
 		return fmt.Errorf("TC program not loaded")
 	}
 
-	vpnIPUint32 := ipToUint32(vpnIP)
+	vpnIPUint32 := IPToUint32(vpnIP)
 	if err := t.vpnClients.Delete(vpnIPUint32); err != nil {
-		return fmt.Errorf("failed to remove VPN client mapping from TC eBPF map: %w", err)
+		return fmt.Errorf("remove VPN client: %w", err)
 	}
 
 	return nil
@@ -223,11 +193,9 @@ func (t *TCProgram) Close() error {
 // GetNATStats returns the NAT statistics from the eBPF map
 func (t *TCProgram) GetNATStats() (map[uint32]uint64, error) {
 	if t == nil || t.natStats == nil {
-		return nil, fmt.Errorf("TC program not loaded or stats map not found")
+		return nil, fmt.Errorf("TC program not loaded")
 	}
-
 	stats := make(map[uint32]uint64)
-	// Read all stat keys (0-9)
 	for i := uint32(0); i < 10; i++ {
 		var value uint64
 		if err := t.natStats.Lookup(i, &value); err == nil {
@@ -236,72 +204,6 @@ func (t *TCProgram) GetNATStats() (map[uint32]uint64, error) {
 	}
 
 	return stats, nil
-}
-
-// LogNATStats logs the NAT statistics for debugging
-func (t *TCProgram) LogNATStats() {
-	if stats, err := t.GetNATStats(); err == nil {
-		log.Printf("TC NAT Stats: Total=%d, VPNNetworkCheck=%d, VPNClientFound=%d, EgressIPFound=%d, NATPerformed=%d, VPNNetworkNotConfigured=%d",
-			stats[4], stats[1], stats[2], stats[3], stats[0], stats[5])
-
-		// Also log VPN network configuration for debugging
-		if t.vpnNetworkConfig != nil {
-			var networkAddr uint32
-			var networkMask uint32
-			if err := t.vpnNetworkConfig.Lookup(uint32(0), &networkAddr); err == nil {
-				if err := t.vpnNetworkConfig.Lookup(uint32(1), &networkMask); err == nil {
-					networkIP := net.IP([]byte{
-						byte(networkAddr >> 24),
-						byte(networkAddr >> 16),
-						byte(networkAddr >> 8),
-						byte(networkAddr),
-					})
-					maskIP := net.IP([]byte{
-						byte(networkMask >> 24),
-						byte(networkMask >> 16),
-						byte(networkMask >> 8),
-						byte(networkMask),
-					})
-					log.Printf("TC NAT VPN Network Config: Network=%s, Mask=%s", networkIP.String(), maskIP.String())
-
-					// Log first few source IPs seen (for debugging)
-					if stats[6] > 0 {
-						log.Printf("TC NAT Debug: Saw %d packets, VPN network: %s (0x%08X), Mask: 0x%08X",
-							stats[6], networkIP.String(), networkAddr, networkMask)
-
-						// Log first few source IPs
-						for i := uint32(7); i < 12 && i-7 < uint32(stats[6]); i++ {
-							if stats[i] > 0 {
-								srcIPUint32 := uint32(stats[i])
-								srcIP := net.IP([]byte{
-									byte(srcIPUint32 >> 24),
-									byte(srcIPUint32 >> 16),
-									byte(srcIPUint32 >> 8),
-									byte(srcIPUint32),
-								})
-								srcNetwork := srcIPUint32 & networkMask
-								log.Printf("TC NAT Debug: Source IP #%d: %s (0x%08X), Network part: 0x%08X, Match: %v",
-									i-6, srcIP.String(), srcIPUint32, srcNetwork, srcNetwork == networkAddr)
-							}
-						}
-
-						// Log VPN network config from eBPF map (if available)
-						if stats[12] > 0 && stats[13] > 0 {
-							vpnNetFromMap := uint32(stats[12])
-							vpnMaskFromMap := uint32(stats[13])
-							log.Printf("TC NAT Debug: VPN config from map: Network=0x%08X, Mask=0x%08X",
-								vpnNetFromMap, vpnMaskFromMap)
-							if stats[14] > 0 {
-								srcNetworkFromMap := uint32(stats[14])
-								log.Printf("TC NAT Debug: Source network (src & mask): 0x%08X, Match: %v",
-									srcNetworkFromMap, srcNetworkFromMap == vpnNetFromMap)
-							}
-						}
-					}
-				}
-			}
-		}
-	}
 }
 
 // attachTCClsact attaches eBPF program to interface using traditional TC clsact qdisc
@@ -406,4 +308,3 @@ func (l *clsactLink) Close() error {
 
 	return nil
 }
-

@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/fisker/zvpn/database"
-	"github.com/fisker/zvpn/handlers"
+	"github.com/fisker/zvpn/internal/configutil"
+	"github.com/fisker/zvpn/internal/database"
 	"github.com/fisker/zvpn/models"
 	"github.com/gin-gonic/gin"
 )
@@ -95,7 +95,7 @@ func (h *Handler) generateProfileXML(c *gin.Context) (string, error) {
 		hostAddress = hostAddress + ":" + port
 	}
 
-	vpnProfileName := handlers.GetVPNProfileName()
+	vpnProfileName := configutil.GetVPNProfileName()
 
 	config.ServerList.HostEntry = []struct {
 		HostName    string `xml:"HostName"`
@@ -188,4 +188,3 @@ func (h *Handler) VPNConfig(c *gin.Context) {
 		"username": user.Username,
 	})
 }
-

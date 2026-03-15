@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fisker/zvpn/auth"
+	"github.com/fisker/zvpn/internal/auth"
 	"golang.org/x/crypto/bcrypt"
 )
 

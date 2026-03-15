@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/fisker/zvpn/database"
+	"github.com/fisker/zvpn/internal/database"
 	"github.com/fisker/zvpn/models"
 	"github.com/gin-gonic/gin"
 )

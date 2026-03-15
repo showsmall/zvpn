@@ -29,10 +29,9 @@ export interface EBPFStats {
   ebpf_enabled: boolean
   total_packets: number
   dropped_packets: number
-  total_bytes: number
-  dropped_bytes: number
-  avg_packet_size: number
-  filter_hits: number
+  tc_nat_performed_packets: number
+  tc_total_packets: number
+  tc_vpn_network_not_configured_packets: number
   timestamp?: number // Optional timestamp for SSE stream updates
 }
 

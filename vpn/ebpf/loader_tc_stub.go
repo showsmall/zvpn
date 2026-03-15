@@ -1,5 +1,5 @@
-//go:build !ebpf
-// +build !ebpf
+//go:build !linux || !ebpf
+// +build !linux !ebpf
 
 package ebpf
 
@@ -25,6 +25,11 @@ func (t *TCProgram) SetPublicIP(publicIP net.IP) error {
 	return fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
 }
 
+// SetVPNNetwork sets the VPN network configuration in TC eBPF.
+func (t *TCProgram) SetVPNNetwork(vpnNetwork string) error {
+	return fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
+}
+
 // AddVPNClient adds a VPN client IP mapping to TC eBPF map
 func (t *TCProgram) AddVPNClient(vpnIP, clientIP net.IP) error {
 	return fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
@@ -35,8 +40,12 @@ func (t *TCProgram) RemoveVPNClient(vpnIP net.IP) error {
 	return fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
 }
 
+// GetNATStats returns the NAT statistics from the eBPF map.
+func (t *TCProgram) GetNATStats() (map[uint32]uint64, error) {
+	return nil, fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
+}
+
 // Close detaches and closes the TC program
 func (t *TCProgram) Close() error {
 	return nil
 }
-  
