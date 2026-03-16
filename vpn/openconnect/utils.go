@@ -197,17 +197,19 @@ func optimizeRoutes(routes []string) []string {
 	// 解析所有路由为 IPNet
 	type routeInfo struct {
 		original string
+		parsed   string
 		ipNet    *net.IPNet
 	}
 	routeInfos := make([]routeInfo, 0, len(routes))
 	for _, route := range routes {
-		_, ipNet, err := net.ParseCIDR(route)
+		parsedRoute, ipNet, err := parseRouteNetwork(route)
 		if err != nil {
 			// 无效路由，跳过
 			continue
 		}
 		routeInfos = append(routeInfos, routeInfo{
 			original: route,
+			parsed:   parsedRoute,
 			ipNet:    ipNet,
 		})
 	}
@@ -234,7 +236,7 @@ func optimizeRoutes(routes []string) []string {
 				break
 			}
 			// 如果完全相同，只保留第一个
-			if rjMaskSize == riMaskSize && ri.ipNet.IP.Equal(rj.ipNet.IP) && i > j {
+			if rjMaskSize == riMaskSize && ri.parsed == rj.parsed && i > j {
 				shouldKeep = false
 				break
 			}
@@ -405,4 +407,5 @@ func validateIPPacket(packet []byte) error {
 
 	return nil
 }
+
 
